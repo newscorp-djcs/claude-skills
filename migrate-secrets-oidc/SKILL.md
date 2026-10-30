@@ -290,8 +290,9 @@ grep -rn "accessKey\|accessKeyType\|artifactory_secret_name\|X-JFrog-Art-Api" <t
 grep -rn "addonPkg\|NewRelicInfra\|NewRelicDotNetAgent\|CrowdStrikeSensor" <terraform-dir>/*.tf
 grep -rn "secretId" <terraform-dir>/*.tf   # already-migrated indicator
 
-# installer_config.installer.version wildcard — check it's pinned to CommonInstaller's current
-# major version, not a stale one (see Step 4, item 7)
+# installer_config.installer.version wildcard — check it's pinned to the current major-version
+# baseline for whichever installer "entry" this project uses (PowerShell vs Linux have different
+# baselines), not a stale one (see Step 4, item 7)
 grep -n -A3 "installer = {" <terraform-dir>/*.tf
 
 # Jenkinsfile-level: dj-shared's terraform() step and its backend/docker credential wiring.
@@ -594,32 +595,49 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
      pattern too (e.g. a `stage` that curls Artifactory for something unrelated to the `terraform()`
      call elsewhere in the same file). Check for it in every repo type, not just build-only/ECS ones.
 
-7. **Check `installer_config.installer.version` is pinned to CommonInstaller's current major-version
-   wildcard, not a stale one:**
+7. **Check `installer_config.installer.version` is pinned to the current major-version wildcard for
+   whichever installer this project actually uses, not a stale one.** There are two unrelated
+   installers with two unrelated version lines — **check `installer_config.installer.entry` first**
+   to know which baseline applies:
    ```hcl
    installer = {
-     entry   = "CommonInstaller-aws.ps1"
+     entry   = "CommonInstaller-aws.ps1"   # Windows/PowerShell -- MarketData/CommonInstaller
+     # entry = "CommonInstaller.sh"        # Linux/bash         -- Quest/LinuxCommonInstaller
      version = "2.1.*"        # <- stale, check this
      branch  = var.commonInstaller
    }
    ```
-   This field is a wildcard matcher resolved against packages CommonInstaller's own `build.ps1`
-   publishes to Artifactory (`$version` there, e.g. `"3.0"`, feeding
-   `CommonInstaller-$version.$Build.zip`). If a deploy repo is still pinned to an older major-version
-   wildcard than what CommonInstaller currently publishes, **no package matches and the install fails
-   to resolve an installer artifact at boot** — this is a hard break, not just staleness. As of the
-   OIDC/Secrets-Manager migration (CommonInstaller bumped to major version 3.0 — see its commit "Bump
-   build version to 3.0 to mark the OIDC/Secrets Manager migration as a major version"), bump this to:
+
+   | `entry` | Installer | Current baseline | Re-derive from |
+   |---|---|---|---|
+   | `CommonInstaller-aws.ps1` | `MarketData/CommonInstaller` (PowerShell) | `"3.0.*"` | `$version` in its `build.ps1` on `develop` |
+   | `CommonInstaller.sh` | `Quest/LinuxCommonInstaller` (bash) | `"3.1.*"` | `major_version` in its `Jenkinsfile.build` on `develop` |
+
+   This field is a wildcard matcher resolved against packages the installer's own build script
+   publishes to Artifactory (e.g. PowerShell's `build.ps1` sets `$version` feeding
+   `CommonInstaller-$version.$Build.zip`; Linux's `Jenkinsfile.build` sets `major_version` feeding
+   `${publishProject}-${major_version}.${env.BUILD_NUMBER}.zip`). If a deploy repo is still pinned to
+   an older major-version wildcard than what its installer currently publishes, **no package matches
+   and the install fails to resolve an installer artifact at boot** — this is a hard break, not just
+   staleness. Bump to the baseline for whichever `entry` this project uses:
    ```hcl
-     version = "3.0.*"
+     version = "3.0.*"   # CommonInstaller-aws.ps1
+     # version = "3.1.*" # CommonInstaller.sh
    ```
-   Check and bump this even for a project where every other Step 1 indicator already shows the
-   secrets-manager pattern in place — the version wildcard is independent of that and can still be
-   stale on its own. To re-derive the current major version in the future (this will go stale again
-   the next time CommonInstaller bumps), check `$version` in CommonInstaller's own `build.ps1` on
-   `develop`:
+   **If the project's current value is already at or above its installer's baseline (e.g. already
+   `"3.1.*"` or `"3.2.*"` for a Linux project), leave it as-is** — don't downgrade a newer pin to match
+   this baseline, and don't treat a higher value as evidence of a typo. Check and bump this even for a
+   project where every other Step 1 indicator already shows the secrets-manager pattern in place — the
+   version wildcard is independent of that and can still be stale on its own. To re-derive the current
+   baseline in the future (each installer's own baseline goes stale independently as that installer
+   bumps its major version again):
+   Both repos live on the Enterprise host (`github.dowjones.net`), not `github.com` — set `GH_HOST`
+   or these 404:
    ```bash
-   gh api repos/MarketData/CommonInstaller/contents/build.ps1?ref=develop --jq '.content' | base64 -d | grep '^\$version'
+   # PowerShell (MarketData/CommonInstaller)
+   GH_HOST=github.dowjones.net gh api repos/MarketData/CommonInstaller/contents/build.ps1?ref=develop --jq '.content' | base64 -d | grep '^\$version'
+   # Linux (Quest/LinuxCommonInstaller)
+   GH_HOST=github.dowjones.net gh api repos/Quest/LinuxCommonInstaller/contents/Jenkinsfile.build?ref=develop --jq '.content' | base64 -d | grep 'major_version'
    ```
 
 8. **ECS components only — migrate the image-pull secret off the old dynamic Secrets Manager lookup
@@ -1202,7 +1220,7 @@ effect for this session.
 | Assuming a RO-registration PR is safe to leave alone because `gh pr view` showed `mergeable: MERGEABLE` right after pushing it | That status is computed against the base branch *at that moment* — it flips to `CONFLICTING` only once a sibling PR editing the same account's `extra_ro_mappings` list actually merges first. Re-check and fix then (Step 11, item 9), don't treat the push-time status as permanent |
 | Jenkinsfile's `terraform()` call already has none of the three patterns | Already migrated at this layer — skip |
 | IAM repo has no Jenkinsfile, or its Jenkinsfile doesn't call `dj-shared`'s `terraform()` step | Nothing to clean up at this layer for the IAM repo — skip Step 8, item 4 |
-| `installer_config.installer.version` already matches CommonInstaller's current major-version wildcard (currently `"3.0.*"`) | Already current — skip (Step 4, item 7) |
+| `installer_config.installer.version` already matches or exceeds its installer's current major-version baseline (`entry = "CommonInstaller-aws.ps1"` → `"3.0.*"`; `entry = "CommonInstaller.sh"` → `"3.1.*"`) | Already current (or newer) — skip, don't downgrade (Step 4, item 7) |
 | A deploy component is ECS-type or build-only (no `installer_config`; uses `ecs_service`/`host_match_rule`/`aws_ecs_service`/`aws_ecs_task_definition`, or has no deploy-target Terraform at all) | Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely for that component. Only do Step 4, item 6 (Jenkinsfile credential cleanup), then Step 6 and Step 12 for the deploy repo alone — no IAM repo involvement at all (see "EC2 vs ECS/build-only") — **unless** the ECS component's image pull is still on the old static-secret pattern (next row) |
 | An ECS component's task definition still resolves its own image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (`credentials_param_arn`/`repositoryCredentials`), instead of Platform Engineering's managed pull secret | This is the one exception to the row above — do Step 4, item 8 (deploy repo: hardcode the managed secret ARN, move the image to `dj-docker-virtual`) *and* Step 8, item 5 (IAM repo: grant the ECS task execution role read access to that secret + its KMS key), in addition to Step 4 item 6. Nothing else in Steps 0-3/5/7/9-11 applies — see the "Exception" callout under "EC2 vs ECS/build-only" |
 | The shared ECS task execution role targeted by Step 8, item 5 already has other, not-yet-migrated services attached to its legacy Artifactory secrets-policy attachment | Leave that legacy attachment in place — only add the new managed-pull-secret policy/attachment alongside it. Don't remove the legacy one (Step 8, item 1) until every service sharing that role has migrated |
@@ -1240,7 +1258,8 @@ effect for this session.
 | Only looking for Pattern D near an existing `terraform()` call, or only in repos that already show Patterns A-C | Pattern D is independent of `terraform()` entirely and is often the *only* pattern present in a build-only Jenkinsfile — check every `stage` in every Jenkinsfile for an Artifactory-credentialed `withCredentials`, regardless of whether `terraform()` appears anywhere in the file |
 | Deleting an entire `withCredentials([...])` block because one of its bindings is now unused | Only remove the specific binding entry for the Artifactory credential; leave other, unrelated bindings (e.g. an Apollo key) alone and only unwrap the step if the list becomes empty |
 | Migrating the deploy repo's Jenkinsfile(s) (Step 4, item 6) and treating the IAM repo as Terraform-only, so its own Jenkinsfile keeps the same credential wiring | The IAM repo almost always has its own `Jenkinsfile` driving its own `terraform apply`, independent of the deploy repo's — always run Step 8, item 4 too; this has actually been missed in practice on a real migration (caught only after the fact, as a follow-up commit to the already-open IAM repo PR) |
-| Leaving `installer_config.installer.version` pinned to a stale major-version wildcard (e.g. `"2.1.*"`) | Check CommonInstaller's `build.ps1` `$version` on `develop` and bump to match (currently `"3.0.*"`) — a stale wildcard matches no currently-published package and breaks provisioning at boot, independent of whether the rest of the secrets-manager migration is otherwise already done (Step 4, item 7) |
+| Leaving `installer_config.installer.version` pinned to a stale major-version wildcard (e.g. `"2.1.*"`) | Check `installer_config.installer.entry` to know which installer/baseline applies (`CommonInstaller-aws.ps1` → `"3.0.*"` from `build.ps1`; `CommonInstaller.sh` → `"3.1.*"` from `Jenkinsfile.build`'s `major_version`), both on `develop`, and bump to match — a stale wildcard matches no currently-published package and breaks provisioning at boot, independent of whether the rest of the secrets-manager migration is otherwise already done (Step 4, item 7) |
+| Applying the PowerShell installer's version baseline (`"3.0.*"`) to a Linux project, or vice versa | Check `installer_config.installer.entry` first — `CommonInstaller-aws.ps1` and `CommonInstaller.sh` are two unrelated installers with two unrelated version lines; they are not interchangeable (Step 4, item 7) |
 | Applying the full EC2 migration (installer_config edits, IAM repo changes, RO registration) to an ECS/build-only component | ECS tasks and build-only pipelines run strictly in Jenkins and have no separate runtime IAM identity needing the Artifactory OIDC grant — classify each component first ("EC2 vs ECS/build-only" near the top) and scope ECS/build-only ones to Jenkinsfile-only cleanup (Step 4, item 6), skipping the IAM repo and RO registration entirely |
 | Assuming one component's EC2/ECS/build-only classification applies to the whole repo | A repo commonly has more than one component (`infrastructure`/`stack`/`switch`), and they can be different types — classify each independently, don't extrapolate from the first one checked |
 | Treating an ECS component's image-pull-secret migration (Step 4, item 8) as covered by the general "ECS is Jenkinsfile-only" rule | It's an exception to that rule — the task definition's own `credentials_param_arn` is a completely different mechanism (image pulls, not the Terraform backend/OIDC `sts:GetWebIdentityToken` pattern) and still needs both a deploy-repo Terraform edit and an IAM-repo grant |
