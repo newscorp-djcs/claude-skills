@@ -19,7 +19,12 @@ of them.
 
 ## Installation
 
-Copy the `migrate-secrets-oidc` folder into your user-level skills directory:
+This skill ships as a plugin in the `claude-skills` marketplace (this repo's
+root). See the top-level [`README.md`](../README.md) for the
+`/plugin marketplace add` / `/plugin install` commands.
+
+To install manually instead, copy the `migrate-secrets-oidc` folder into your
+user-level skills directory:
 
 ```bash
 cp -r migrate-secrets-oidc ~/.claude/skills/
@@ -82,6 +87,21 @@ cleaned up once the pinned `dj-shared` library ref is OIDC-aware:
 Pattern D is the common (often *only*) case for build-only/ECS Jenkinsfiles
 that never call `terraform()`. Each pattern has its own gating check against
 the pinned library ref — see "Tolerance / idempotency rules" in `SKILL.md`.
+
+Pattern D isn't limited to `sh`/shell credential bodies, and it isn't limited
+to projects that skip Terraform entirely. Two sub-cases, found while reviewing
+`AdTech/Seawolf/terraform/Jenkinsfile`, get the same `withArtifactoryOidcCredentials`
+treatment:
+
+- A Groovy-level call into the Jenkins Artifactory Plugin (`Artifactory.newServer(...)`)
+  that reads its `username`/`password` from a `withCredentials` block, rather than
+  shelling out to `curl`.
+- A hand-rolled `terraform init`/`apply` invocation that bypasses `dj-shared`'s
+  `terraform()` step entirely (calls the `terraform` binary directly inside a
+  `sh` block) — don't mistake this for Pattern A, which only applies when the
+  Jenkinsfile actually calls `terraform()`.
+
+See the Pattern D section in `SKILL.md` for the full before/after examples.
 
 ## Safety model
 

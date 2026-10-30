@@ -594,6 +594,62 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
    - **Not exclusive to build-only/ECS** — an EC2-type repo's Jenkinsfile can independently have this
      pattern too (e.g. a `stage` that curls Artifactory for something unrelated to the `terraform()`
      call elsewhere in the same file). Check for it in every repo type, not just build-only/ECS ones.
+   - **Not limited to `sh`/shell bodies** — the same wrapper swap applies to Groovy-level Jenkins
+     Artifactory Plugin calls (e.g. `Artifactory.newServer(url: '...', username: aUser, password:
+     aPass)`), since `withArtifactoryOidcCredentials` binds via `withEnv` either way and `env.<var>`
+     reads identically from Groovy or a shell string. Example (seen in
+     `AdTech/Seawolf/terraform/Jenkinsfile`'s "Retrieve" stage):
+     ```groovy
+     // before
+     withCredentials([usernamePassword(credentialsId: 'artifactory_terraform_backend', usernameVariable: 'artifactory_user', passwordVariable: 'artifactory_pass')]) {
+       def aUser = env.artifactory_user
+       def aPass = env.artifactory_pass
+       def server = Artifactory.newServer url: 'https://artifactory.dowjones.io:443/artifactory', username: aUser, password: aPass
+       server.download(downloadSpec)
+     }
+     ```
+     ```groovy
+     // after
+     withArtifactoryOidcCredentials(scope: 'ro', usernameVariable: 'artifactory_user', passwordVariable: 'artifactory_pass') {
+       def aUser = env.artifactory_user
+       def aPass = env.artifactory_pass
+       def server = Artifactory.newServer url: 'https://artifactory.dowjones.io:443/artifactory', username: aUser, password: aPass
+       server.download(downloadSpec)
+     }
+     ```
+     The minted OIDC token works as the Basic-auth password half of this plugin's `username`/
+     `password` constructor args exactly like it does for a shell `curl -u`, so the body genuinely
+     needs zero changes beyond the wrapper and variable names — same "preserve the body" rule as above.
+   - **Also covers a hand-rolled `terraform init`/`apply` invocation that bypasses `dj-shared`'s
+     `terraform()` step entirely** (e.g. a custom action — state refresh, import, a one-off migration
+     — that calls the real `terraform` binary directly via `sh` with its own `-backend-config
+     username=...`/`password=...` flags, rather than going through `terraform(...)`). Don't mistake
+     this for Pattern A just because it sets backend-config username/password — Pattern A only applies
+     when the credential feeds `dj-shared`'s own `terraform()` call, which auto-injects OIDC itself;
+     a direct `sh "terraform init ..."` invocation gets none of that and needs the same Pattern D
+     wrapper treatment as any other non-`terraform()` usage, scoped `rw` if it writes state:
+     ```groovy
+     // before
+     withCredentials([usernamePassword(credentialsId: 'artifactory_terraform_backend', usernameVariable: 'artifactory_user', passwordVariable: 'artifactory_pass')]) {
+       sh '''
+         curl -fsS -u "${artifactory_user}:${artifactory_pass}" -o state-before.tfstate "${TF_STATE_URL}"
+         terraform-${TF_VERSION} init -backend-config "username=${artifactory_user}" -backend-config "password=${artifactory_pass}"
+       '''
+     }
+     ```
+     ```groovy
+     // after
+     withArtifactoryOidcCredentials(scope: 'rw', usernameVariable: 'artifactory_user', passwordVariable: 'artifactory_pass') {
+       sh '''
+         curl -fsS -u "${artifactory_user}:${artifactory_pass}" -o state-before.tfstate "${TF_STATE_URL}"
+         terraform-${TF_VERSION} init -backend-config "username=${artifactory_user}" -backend-config "password=${artifactory_pass}"
+       '''
+     }
+     ```
+     A single Jenkinsfile can have this *and* a normal `terraform(...)` call elsewhere (e.g. one custom
+     action path hand-rolls `terraform init`, another path calls `terraform(...)` normally) — migrate
+     each independently: the hand-rolled path needs the Pattern D wrapper above, the `terraform(...)`
+     path just needs Pattern A's `username`/`password` keys deleted, no wrapper.
 
 7. **Check `installer_config.installer.version` is pinned to the current major-version wildcard for
    whichever installer this project actually uses, not a stale one.** There are two unrelated

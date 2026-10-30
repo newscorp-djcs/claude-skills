@@ -1,0 +1,10 @@
+{
+  "name": "migrate-secrets-oidc",
+  "version": "1.0.0",
+  "description": "Migrate a CommonInstaller-based deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime Secrets Manager fetch + OIDC Artifactory auth.",
+  "author": {
+    "name": "Steve Stevenson"
+  },
+  "repository": "https://github.com/newscorp-djcs/claude-skills",
+  "keywords": ["artifactory", "oidc", "secrets-manager", "jenkins", "terraform"]
+}

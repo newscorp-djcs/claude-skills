@@ -1,0 +1,15 @@
+{
+  "name": "claude-skills",
+  "owner": {
+    "name": "Steve Stevenson"
+  },
+  "description": "Internal Claude Code skills/plugins for Dow Jones infrastructure and platform engineering work.",
+  "plugins": [
+    {
+      "name": "migrate-secrets-oidc",
+      "source": "./migrate-secrets-oidc",
+      "description": "Migrate a CommonInstaller-based deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime Secrets Manager fetch + OIDC Artifactory auth.",
+      "category": "infrastructure"
+    }
+  ]
+}
