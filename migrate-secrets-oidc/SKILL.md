@@ -1,6 +1,6 @@
 ---
 name: migrate-secrets-oidc
-description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime AWS Secrets Manager fetch plus OIDC-based Artifactory auth — across the deploy repo, its IAM repo (grants sts:GetWebIdentityToken), and dj-terraform-aws-artifactory-token-management (registers the role for RO access, now mandatory since the account-wide RO catch-all was removed). For ECS-based or build-only deploy components (no CommonInstaller/installer_config, no separate runtime IAM identity outside Jenkins), scope narrows to Jenkinsfile-only dj-shared credential cleanup — no IAM/Artifactory changes needed. Use when asked to "migrate this project to the new secrets pattern", "move off the static Artifactory key", "apply the secrets-manager-runtime-fetch pattern", "update IAM for the new CommonInstaller secrets/OIDC flow", "register a role for Artifactory RO/OIDC access", or "clean up the Jenkinsfile credentials for this ECS project".
+description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime AWS Secrets Manager fetch plus OIDC-based Artifactory auth — across the deploy repo, its IAM repo (grants sts:GetWebIdentityToken), and dj-terraform-aws-artifactory-token-management (registers the role for RO access, now mandatory since the account-wide RO catch-all was removed). For ECS-based or build-only deploy components (no CommonInstaller/installer_config, no separate runtime IAM identity outside Jenkins), scope narrows to Jenkinsfile-only dj-shared credential cleanup — no IAM/Artifactory changes needed. Exception: if the ECS task definition itself still resolves its Artifactory image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (fed into `credentials_param_arn`/`repositoryCredentials`), that still needs a deploy-repo Terraform edit (hardcode Platform Engineering's managed pull-secret ARN, move the image to `dj-docker-virtual`) and an IAM-repo grant on the ECS task *execution* role — a different, narrower mechanism than the EC2 OIDC/RO-registration pattern. Use when asked to "migrate this project to the new secrets pattern", "move off the static Artifactory key", "apply the secrets-manager-runtime-fetch pattern", "update IAM for the new CommonInstaller secrets/OIDC flow", "register a role for Artifactory RO/OIDC access", "clean up the Jenkinsfile credentials for this ECS project", or "move this ECS task off the static Artifactory pull secret to the managed pull secret".
 ---
 
 # Migrate a deploy project to runtime Secrets Manager + OIDC Artifactory auth
@@ -100,7 +100,7 @@ done
 | Component type | Detection | What applies |
 |---|---|---|
 | **EC2** | `installer_config`/`addonPkg` present, or a module `source` referencing `dj-terracycle`'s `ec2_instance`/`ec2_stack`/`ec2_cluster` | Everything — Steps 0-11, as described below. |
-| **ECS** (Fargate) | No `installer_config`; a module `source` referencing `dj-terracycle`'s `ecs_service`/`host_match_rule`, or raw `aws_ecs_service`/`aws_ecs_task_definition` resources | **Jenkinsfile-only.** Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely — there's no `installer_config` to migrate and no separate runtime IAM identity needing the OIDC/secrets grant (that's handled inside Jenkins already). Only **Step 4, item 6** (Jenkinsfile credential cleanup), then Step 6 (commit) and Step 12 (hand off) for the deploy repo alone. No IAM repo involvement at all. |
+| **ECS** (Fargate) | No `installer_config`; a module `source` referencing `dj-terracycle`'s `ecs_service`/`host_match_rule`, or raw `aws_ecs_service`/`aws_ecs_task_definition` resources | **Jenkinsfile-only.** Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely — there's no `installer_config` to migrate and no separate runtime IAM identity needing the OIDC/secrets grant (that's handled inside Jenkins already). Only **Step 4, item 6** (Jenkinsfile credential cleanup), then Step 6 (commit) and Step 12 (hand off) for the deploy repo alone. No IAM repo involvement at all. **Exception — see below** if the task definition's image pull also uses the old static-secret pattern. |
 | **Build-only** (a CI pipeline with no deploy-target Terraform of its own) | No EC2/ECS Terraform at all; just a Jenkinsfile | Same as ECS — Jenkinsfile-only (Step 4, item 6), no IAM repo, no RO registration. |
 
 **If a repo has both EC2 and ECS/build-only components:** run the full flow (Steps 0-11) only
@@ -111,6 +111,36 @@ vice versa). The one place this matters most is Step 11: an EC2 component in the
 ECS component still needs its own RO registration even though the ECS component doesn't. State which
 components got which scope back to the user before editing anything, so they can correct the
 classification if it's ambiguous (neither signal present, or both).
+
+### Exception: an ECS component's own image pull still on the old static-secret pattern
+
+The "Jenkinsfile-only, no IAM repo" rule above is about the **Terraform backend/Terraform-image**
+credential the Jenkinsfile feeds into `dj-shared`'s `terraform()` step — a completely different
+thing from how the **ECS task itself pulls its application's Docker image** from Artifactory. That
+second mechanism has its own old/new pattern, independent of everything else in this skill:
+
+- **Old pattern**: the ECS task definition's `credentials_param_arn` (or raw
+  `repositoryCredentials.credentialsParameter`) is fed by a project-specific
+  `data "aws_secretsmanager_secret"` data source (e.g. named `repo_secret`, looking up
+  `"${var.env}/Artifactory/djsp"`), pointing at a static per-environment Artifactory credential, and
+  the image reference uses a different registry path/port (e.g. `artifactory.dowjones.io:5001/...`).
+- **New pattern**: the task definition points at Platform Engineering's **managed, shared, OIDC-refreshed
+  pull secret** (cross-account, lives in PIB build) instead, and the image moves to the
+  `dj-docker-virtual` registry path that secret is scoped to.
+
+Detect it:
+```bash
+grep -rn 'aws_secretsmanager_secret\|credentials_param_arn\|repositoryCredentials' <terraform-dir>/*.tf
+```
+
+If this old pattern is present on an ECS component, **do Step 4, item 8 (deploy repo), and open the
+IAM repo narrowly for Step 7's role-discovery plus Step 8, item 5 (IAM repo)**, in addition to (not
+instead of) the Jenkinsfile-only cleanup in Step 4, item 6 — this is the one case where an ECS
+component's deploy repo *and* its IAM repo both still need edits. The IAM-repo work here is narrow:
+find the ECS task **execution** role (not the full Step 7 discovery for an EC2 project's own
+`sts:GetWebIdentityToken` role/secrets grants — there's no such grant to find for ECS) and add only
+the item-5 policy/attachment. Everything else that's skipped for ECS (Steps 0-3, 5, 9-11) stays
+skipped; this exception adds exactly two items, nothing more.
 
 ---
 
@@ -272,6 +302,10 @@ for f in $(find . -iname Jenkinsfile); do
   grep -n "@Library('dj-shared" "$f"
   grep -n "withCredentials\|artifactory_terraform_backend\|backendConfig\|credential:" "$f"
 done
+
+# ECS image-pull secret old pattern (see Step 4, item 8) — independent of everything above,
+# only relevant if this component is ECS-type (aws_ecs_task_definition / credentials_param_arn present)
+grep -rn "credentials_param_arn\|repositoryCredentials" --include=*.tf .
 ```
 
 Report what you find before changing anything. If `secretId` usage already covers every secret-needing
@@ -333,7 +367,8 @@ git checkout -b feature/secrets-manager-oidc-migration origin/develop
 **For an ECS/build-only component (see "EC2 vs ECS/build-only" above), skip straight to item 6
 below** — items 1-5
 and 7 only apply to EC2-type components, since there's no `installer_config` on an ECS component to
-edit in the first place.
+edit in the first place. **If that ECS component's image pull is also still on the old static-secret
+pattern (see the "Exception" callout above), also do item 8 below.**
 
 In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`, or wherever
 `installer_config` actually lives):
@@ -524,7 +559,62 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
    gh api repos/MarketData/CommonInstaller/contents/build.ps1?ref=develop --jq '.content' | base64 -d | grep '^\$version'
    ```
 
-   In every pattern found: remove only the specific credential-binding entry (the `usernamePassword(...)`
+8. **ECS components only — migrate the image-pull secret off the old dynamic Secrets Manager lookup
+   onto Platform Engineering's managed, OIDC-refreshed pull secret.** This applies when the task
+   definition's `credentials_param_arn`/`repositoryCredentials.credentialsParameter` is fed by a
+   project-specific `data "aws_secretsmanager_secret"` lookup rather than the shared cross-account
+   secret (see the "Exception" callout under "EC2 vs ECS/build-only" above for how to detect this).
+   It's unrelated to the OIDC/`sts:GetWebIdentityToken` pattern used elsewhere in this skill — ECS
+   pulls the image *before* the task's own code runs, so it can't do a runtime token exchange itself;
+   instead it reads a secret Platform Engineering keeps refreshed on its behalf. The authoritative
+   current values live in "ECS / Fargate image pulls (managed pull secret)" in
+   `dj-terraform-aws-artifactory-token-management`'s `iam-oidc-artifactory-token-consumer-guide.md` —
+   re-check that doc rather than trusting the values below if they look stale (the secret's ARN
+   suffix only changes if it's ever recreated, at which point that guide is updated).
+
+   a. **Remove the dynamic lookup** (commonly in `data.tf`):
+   ```hcl
+   # before
+   data "aws_secretsmanager_secret" "repo_secret" {
+     name = "${var.env}/Artifactory/djsp"
+   }
+   ```
+   Before removing, grep the whole repo for other references to that data source's local name (same
+   rule as item 1 above) — if it's used anywhere else, flag it and ask first.
+
+   b. **Add the managed secret's ARN as a local** (in `main.tf`, next to the ECS service/task
+   definition locals), and point the task definition's credential param at it:
+   ```hcl
+   # Platform Engineering's managed Artifactory pull secret (OIDC-refreshed, read-only on
+   # dj-docker-virtual). Must be the full ARN including the suffix for cross-account
+   # repositoryCredentials — see the consumer guide if this looks stale.
+   artifactory_pull_secret_arn = "arn:aws:secretsmanager:us-east-1:775258986048:secret:djin-prod-artifactory-ecs-docker-ro-NoaPmf"
+   ```
+   ```hcl
+   # before
+   credentials_param_arn = data.aws_secretsmanager_secret.repo_secret.arn
+   # after
+   credentials_param_arn = local.artifactory_pull_secret_arn
+   ```
+
+   c. **Move the image reference onto the `dj-docker-virtual` path** the managed secret is scoped to
+   (READ-only) — the old static-credential image path commonly used a different registry
+   subpath/port:
+   ```hcl
+   # before
+   image = "artifactory.dowjones.io:5001/${local.image}"
+   # after
+   image = "artifactory.dowjones.io/dj-docker-virtual/${local.image}"
+   ```
+   If the existing image path doesn't look like this shape (e.g. it's already a different named
+   virtual repo), confirm with the user rather than assuming the `:5001` → `dj-docker-virtual`
+   rewrite applies as-is.
+
+   d. **This has a hard IAM-repo dependency** — the ECS task **execution** role (not the task role)
+   needs read access to the managed secret and its KMS key, or image pulls fail at task start/scale-out.
+   See Step 8, item 5. Don't let the deploy-repo PR merge/apply ahead of the IAM-repo one.
+
+   Back to item 6's Jenkinsfile patterns: in every pattern found there, remove only the specific credential-binding entry (the `usernamePassword(...)`
    or `string(...)` list item) that supplies the Artifactory credential — if the same
    `withCredentials([...])` call also binds other, unrelated credentials used elsewhere in the block
    (e.g. an Apollo key, an SSH key), leave those bindings alone and only unwrap/remove the whole
@@ -574,7 +664,10 @@ Stage only the files actually changed and commit with a message describing the m
 *(EC2-type components only — see "EC2 vs ECS/build-only" above. Skip Steps 7-11 entirely for an
 ECS/build-only component; don't open or touch an IAM repo for it at all — the Jenkins pipeline
 already has whatever OIDC/secrets permissions it needs, independent of any project-specific IAM
-role.)*
+role. **Exception:** if the ECS component's image pull is still on the old static-secret pattern
+(see the "Exception" callout under "EC2 vs ECS/build-only"), open the IAM repo narrowly to find the
+ECS task **execution** role for Step 8, item 5 — nothing else in Steps 7-11 applies, there's no
+`sts:GetWebIdentityToken`/secrets grant or RO registration involved in this exception.)*
 
 ```bash
 cd <iam-repo>            # ask for this path if not given; default guess is mktdata-iam — confirm, don't assume
@@ -608,8 +701,9 @@ grants unprompted.
 
 ## Step 8 — Edit the IAM repo
 
-*(EC2-type components only — see "EC2 vs ECS/build-only" above. Skip entirely for an ECS/build-only
-component.)*
+*(Items 1-4: EC2-type components only — see "EC2 vs ECS/build-only" above. Skip entirely for an
+ECS/build-only component. Item 5 is the exception: an ECS component whose image pull is still on the
+old static-secret pattern needs item 5 only — none of items 1-4.)*
 
 1. **Remove the Artifactory-specific secrets policy attachment** on the role, if one exists — it's
    now dead weight since Artifactory auth no longer reads from Secrets Manager. Don't touch the
@@ -726,12 +820,92 @@ component.)*
    entirely because the rest of the IAM repo migration is pure Terraform — don't let that pattern
    match fool you into thinking the Jenkinsfile layer doesn't apply here too.
 
+5. **ECS image-pull secret exception only** (see "EC2 vs ECS/build-only" above and Step 4, item 8) —
+   grant the ECS task **execution** role read access to Platform Engineering's managed pull secret and
+   its KMS key. **Target the task execution role, not the task role** — the task role needs nothing
+   for image pulls (per the consumer guide). This role is very commonly shared across several
+   unrelated services in the same account (e.g. a single `ecs-task-execution-role` reused by multiple
+   deploy repos) — check `grep -rn "aws_iam_role_policy_attachment" <iam-repo>/global/role-*execution*.tf`
+   to see what else is already attached before assuming this role is dedicated to the one project
+   you're migrating.
+
+   a. **Check whether the shared policy already exists** in this IAM repo before creating a new one:
+   ```bash
+   grep -rln "GetSecretValue.*artifactory\|djin-prod-artifactory-ecs-docker-ro" <iam-repo>/global/*.tf
+   ```
+   If it exists, just add the attachment (skip to step 5c). If not, create it following the repo's
+   existing shared-policy convention — re-check
+   `iam-oidc-artifactory-token-consumer-guide.md`'s "ECS / Fargate image pulls" section for the
+   current secret/KMS ARNs before hardcoding them here, in case they've changed since this was
+   written:
+   ```hcl
+   # policy-artifactory-ecs-pull-secret-shared.tf
+   data "aws_iam_policy_document" "artifactory_ecs_pull_secret_iam_document" {
+     statement {
+       sid    = "ReadArtifactoryPullSecret"
+       effect = "Allow"
+       actions = [
+         "secretsmanager:GetSecretValue"
+       ]
+       resources = [
+         "arn:aws:secretsmanager:us-east-1:775258986048:secret:djin-prod-artifactory-ecs-docker-ro-*"
+       ]
+     }
+
+     statement {
+       sid    = "DecryptArtifactoryPullSecret"
+       effect = "Allow"
+       actions = [
+         "kms:Decrypt"
+       ]
+       resources = [
+         "arn:aws:kms:us-east-1:775258986048:key/781a4c14-b7c9-4dd4-ad6b-c79f500c32b7"
+       ]
+       condition {
+         test     = "StringEquals"
+         variable = "kms:ViaService"
+         values   = ["secretsmanager.us-east-1.amazonaws.com"]
+       }
+     }
+   }
+
+   resource "aws_iam_policy" "artifactory_ecs_pull_secret_shared_policy" {
+     count       = var.region_id == "us-east-1" ? 1 : 0
+     name        = "mktdata_artifactory_ecs_pull_secret"
+     description = "Policy to grant ECS execution roles read access to the managed Artifactory Docker pull secret"
+     policy      = data.aws_iam_policy_document.artifactory_ecs_pull_secret_iam_document.json
+   }
+   ```
+   Note the `resources` uses a **wildcard suffix** (`...-docker-ro-*`) on the secret ARN — unlike
+   Step 4, item 8b's deploy-repo reference, which needs the exact suffixed ARN. The policy document
+   can be a wildcard; the task definition's `credentials_param_arn` cannot.
+
+   b. **Keep the condition on the KMS statement** (`kms:ViaService` = Secrets Manager) — it's what
+   scopes the decrypt grant to only this use, rather than a bare grant on that KMS key for any
+   service.
+
+   c. **Attach the role to it**, the same `aws_iam_role_policy_attachment`-per-role convention as
+   Step 8, item 2:
+   ```hcl
+   resource "aws_iam_role_policy_attachment" "ecs_task_execution_artifactory_ecs_pull_secret_iam_attachment" {
+     role       = aws_iam_role.ecs_task_execution_role.id
+     policy_arn = element(concat(aws_iam_policy.artifactory_ecs_pull_secret_shared_policy.*.arn, [""]), 0)
+   }
+   ```
+
+   d. **Leave the legacy Artifactory secrets-policy attachment on this role in place** (don't apply
+   Step 8, item 1's removal here) **if any other service still using the same shared execution role
+   hasn't migrated yet** — check what else attaches to it (per the grep above) and ask the user if
+   it's unclear. Dropping the legacy attachment while a sibling service still depends on it breaks
+   that sibling's image pulls. Only remove it once every consumer of that specific role has migrated.
+
 ---
 
 ## Step 9 — Validate the IAM repo changes
 
-*(EC2-type components only — see "EC2 vs ECS/build-only" above. Skip entirely for an ECS/build-only
-component.)*
+*(Items 1-4's gating: EC2-type components only — see "EC2 vs ECS/build-only" above, skip entirely
+for an ECS/build-only component. If only item 5 (the ECS pull-secret exception) applied in Step 8,
+still run this validation for that change.)*
 
 ```bash
 terraform fmt -check -diff global/
@@ -745,7 +919,8 @@ Same caveat as Step 5 — `terraform validate` may not be runnable without priva
 ## Step 10 — Commit the IAM repo (do not push yet)
 
 *(EC2-type components only — see "EC2 vs ECS/build-only" above. Skip entirely for an ECS/build-only
-component.)*
+component — except if Step 8, item 5's pull-secret grant applied, in which case commit that change
+here too.)*
 
 Stage only the files actually changed and commit. Do not push.
 
@@ -918,7 +1093,10 @@ how it plugs into this skill's flow, not a replacement for it.
 ## Step 12 — Hand off for review (deploy + IAM repos)
 
 For a purely ECS/build-only component, there's only the deploy repo's Jenkinsfile commit to hand
-off — no IAM repo involvement, so skip anything below that refers to the IAM repo.
+off — no IAM repo involvement, so skip anything below that refers to the IAM repo. **Exception:** if
+the ECS image-pull secret migration (Step 4, item 8 / Step 8, item 5) applied, hand off both repos —
+flag explicitly that the deploy-repo PR has a hard dependency on the IAM-repo PR merging/applying
+first (image pulls fail otherwise), so the user merges them in that order.
 
 Show the user, for the deploy and IAM repos:
 - `git diff --stat` and `git log -1` for the new commit
@@ -958,7 +1136,9 @@ effect for this session.
 | Jenkinsfile's `terraform()` call already has none of the three patterns | Already migrated at this layer — skip |
 | IAM repo has no Jenkinsfile, or its Jenkinsfile doesn't call `dj-shared`'s `terraform()` step | Nothing to clean up at this layer for the IAM repo — skip Step 8, item 4 |
 | `installer_config.installer.version` already matches CommonInstaller's current major-version wildcard (currently `"3.0.*"`) | Already current — skip (Step 4, item 7) |
-| A deploy component is ECS-type or build-only (no `installer_config`; uses `ecs_service`/`host_match_rule`/`aws_ecs_service`/`aws_ecs_task_definition`, or has no deploy-target Terraform at all) | Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely for that component. Only do Step 4, item 6 (Jenkinsfile credential cleanup), then Step 6 and Step 12 for the deploy repo alone — no IAM repo involvement at all (see "EC2 vs ECS/build-only") |
+| A deploy component is ECS-type or build-only (no `installer_config`; uses `ecs_service`/`host_match_rule`/`aws_ecs_service`/`aws_ecs_task_definition`, or has no deploy-target Terraform at all) | Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely for that component. Only do Step 4, item 6 (Jenkinsfile credential cleanup), then Step 6 and Step 12 for the deploy repo alone — no IAM repo involvement at all (see "EC2 vs ECS/build-only") — **unless** the ECS component's image pull is still on the old static-secret pattern (next row) |
+| An ECS component's task definition still resolves its own image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (`credentials_param_arn`/`repositoryCredentials`), instead of Platform Engineering's managed pull secret | This is the one exception to the row above — do Step 4, item 8 (deploy repo: hardcode the managed secret ARN, move the image to `dj-docker-virtual`) *and* Step 8, item 5 (IAM repo: grant the ECS task execution role read access to that secret + its KMS key), in addition to Step 4 item 6. Nothing else in Steps 0-3/5/7/9-11 applies — see the "Exception" callout under "EC2 vs ECS/build-only" |
+| The shared ECS task execution role targeted by Step 8, item 5 already has other, not-yet-migrated services attached to its legacy Artifactory secrets-policy attachment | Leave that legacy attachment in place — only add the new managed-pull-secret policy/attachment alongside it. Don't remove the legacy one (Step 8, item 1) until every service sharing that role has migrated |
 
 ---
 
@@ -993,3 +1173,6 @@ effect for this session.
 | Leaving `installer_config.installer.version` pinned to a stale major-version wildcard (e.g. `"2.1.*"`) | Check CommonInstaller's `build.ps1` `$version` on `develop` and bump to match (currently `"3.0.*"`) — a stale wildcard matches no currently-published package and breaks provisioning at boot, independent of whether the rest of the secrets-manager migration is otherwise already done (Step 4, item 7) |
 | Applying the full EC2 migration (installer_config edits, IAM repo changes, RO registration) to an ECS/build-only component | ECS tasks and build-only pipelines run strictly in Jenkins and have no separate runtime IAM identity needing the Artifactory OIDC grant — classify each component first ("EC2 vs ECS/build-only" near the top) and scope ECS/build-only ones to Jenkinsfile-only cleanup (Step 4, item 6), skipping the IAM repo and RO registration entirely |
 | Assuming one component's EC2/ECS/build-only classification applies to the whole repo | A repo commonly has more than one component (`infrastructure`/`stack`/`switch`), and they can be different types — classify each independently, don't extrapolate from the first one checked |
+| Treating an ECS component's image-pull-secret migration (Step 4, item 8) as covered by the general "ECS is Jenkinsfile-only" rule | It's an exception to that rule — the task definition's own `credentials_param_arn` is a completely different mechanism (image pulls, not the Terraform backend/OIDC `sts:GetWebIdentityToken` pattern) and still needs both a deploy-repo Terraform edit and an IAM-repo grant |
+| Granting the ECS **task role** instead of the task **execution** role for the managed pull secret (Step 8, item 5) | The task role needs nothing for image pulls — only the execution role reads the secret, since the pull happens before the container (and its task role) exists |
+| Hardcoding the managed pull secret's ARN/KMS values into the skill from memory without checking the consumer guide first | The secret's ARN suffix changes if it's ever recreated — `iam-oidc-artifactory-token-consumer-guide.md`'s "ECS / Fargate image pulls" section is the source of truth; re-check it rather than trusting a stale copy here |
