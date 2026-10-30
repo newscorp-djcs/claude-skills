@@ -1,6 +1,6 @@
 ---
 name: migrate-secrets-oidc
-description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime AWS Secrets Manager fetch plus OIDC-based Artifactory auth — across the deploy repo, its IAM repo (grants sts:GetWebIdentityToken), and dj-terraform-aws-artifactory-token-management (registers the role for RO access, now mandatory since the account-wide RO catch-all was removed). For ECS-based or build-only deploy components (no CommonInstaller/installer_config, no separate runtime IAM identity outside Jenkins), scope narrows to Jenkinsfile-only dj-shared credential cleanup — no IAM/Artifactory changes needed. Exception: if the ECS task definition itself still resolves its Artifactory image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (fed into `credentials_param_arn`/`repositoryCredentials`), that still needs a deploy-repo Terraform edit (hardcode Platform Engineering's managed pull-secret ARN, move the image to `dj-docker-virtual`) and an IAM-repo grant on the ECS task *execution* role — a different, narrower mechanism than the EC2 OIDC/RO-registration pattern. Use when asked to "migrate this project to the new secrets pattern", "move off the static Artifactory key", "apply the secrets-manager-runtime-fetch pattern", "update IAM for the new CommonInstaller secrets/OIDC flow", "register a role for Artifactory RO/OIDC access", "clean up the Jenkinsfile credentials for this ECS project", or "move this ECS task off the static Artifactory pull secret to the managed pull secret".
+description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime AWS Secrets Manager fetch plus OIDC-based Artifactory auth — across the deploy repo, its IAM repo (grants sts:GetWebIdentityToken), and dj-terraform-aws-artifactory-token-management (registers the role for RO access, now mandatory since the account-wide RO catch-all was removed). For ECS-based or build-only deploy components (no CommonInstaller/installer_config, no separate runtime IAM identity outside Jenkins), scope narrows to Jenkinsfile-only dj-shared credential cleanup — no IAM/Artifactory changes needed. This covers both credentials fed into dj-shared's `terraform()` step (backendConfig.username/password, backendConfig.token, docker.credential) and, for build-only/ECS Jenkinsfiles that don't call `terraform()` at all, any other `withCredentials`-bound Artifactory credential wrapping an arbitrary script block (curl, docker login, npm, etc.) — replaced with dj-shared's `withArtifactoryOidcCredentials` step. Exception: if the ECS task definition itself still resolves its Artifactory image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (fed into `credentials_param_arn`/`repositoryCredentials`), that still needs a deploy-repo Terraform edit (hardcode Platform Engineering's managed pull-secret ARN, move the image to `dj-docker-virtual`) and an IAM-repo grant on the ECS task *execution* role — a different, narrower mechanism than the EC2 OIDC/RO-registration pattern. Use when asked to "migrate this project to the new secrets pattern", "move off the static Artifactory key", "apply the secrets-manager-runtime-fetch pattern", "update IAM for the new CommonInstaller secrets/OIDC flow", "register a role for Artifactory RO/OIDC access", "clean up the Jenkinsfile credentials for this ECS project", "remove Artifactory credentials from this build-only project", or "move this ECS task off the static Artifactory pull secret to the managed pull secret".
 ---
 
 # Migrate a deploy project to runtime Secrets Manager + OIDC Artifactory auth
@@ -301,6 +301,10 @@ for f in $(find . -iname Jenkinsfile); do
   echo "=== $f ==="
   grep -n "@Library('dj-shared" "$f"
   grep -n "withCredentials\|artifactory_terraform_backend\|backendConfig\|credential:" "$f"
+  # Pattern D candidates: an Artifactory credential bound via withCredentials for something
+  # other than dj-shared's terraform() step (common in build-only Jenkinsfiles that never call
+  # terraform() at all) — see Step 4, item 6, Pattern D
+  grep -n -i "credentialsId.*artifactory\|artifactory.*credentialsId" "$f"
 done
 
 # ECS image-pull secret old pattern (see Step 4, item 8) — independent of everything above,
@@ -430,15 +434,27 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
      --jq '.content' | base64 -d | grep -n "no longer supported"
    ```
    If this prints all three — `backendConfig.username`/`password`, `backendConfig.token`, and
-   `docker.credential` — the ref is OIDC-aware and it's safe to proceed below. If it prints nothing (or
-   only some), the pinned ref doesn't fully support OIDC yet — **do not touch the Jenkinsfile**; flag
-   this to the user the same way Step 0 flags an unfixed `dj-terracycle` ref, and ask whether to bump
-   the `@Library('dj-shared@...')` ref as a prerequisite or leave the Jenkinsfile as an interim shim
-   until that library's OIDC migration ships more broadly.
+   `docker.credential` — the ref is OIDC-aware and it's safe to proceed with Patterns A-C below. If it
+   prints nothing (or only some), the pinned ref doesn't fully support OIDC yet — **do not touch the
+   Jenkinsfile**; flag this to the user the same way Step 0 flags an unfixed `dj-terracycle` ref, and
+   ask whether to bump the `@Library('dj-shared@...')` ref as a prerequisite or leave the Jenkinsfile
+   as an interim shim until that library's OIDC migration ships more broadly.
 
-   Once confirmed OIDC-aware, up to three independent patterns may be present — remove whichever
-   apply (a single Jenkinsfile can have more than one, unlike the deploy/IAM-repo migration where the
-   old patterns are mutually exclusive):
+   **Pattern D has its own, separate gating check** — it's a different step (`withArtifactoryOidcCredentials`),
+   added to `dj-shared` after Patterns A-C's `terraform()` changes, so a ref can be OIDC-aware for A-C
+   and still lack it:
+   ```bash
+   gh api -H "Accept: application/vnd.github+json" \
+     "https://github.dowjones.net/api/v3/repos/Infrastructure/jenkins-pipeline-shared/contents/vars/withArtifactoryOidcCredentials.groovy?ref=<pinned-ref-or-default-branch>" \
+     --jq '.content' 2>/dev/null
+   ```
+   A 404 (empty output / `gh api` error) means the pinned ref doesn't have this step yet — leave any
+   Pattern D candidate's `withCredentials` wiring in place and flag it the same way, rather than
+   applying Pattern D below.
+
+   Once confirmed OIDC-aware for the pattern(s) present, up to four independent patterns may be
+   present — remove whichever apply (a single Jenkinsfile can have more than one, unlike the
+   deploy/IAM-repo migration where the old patterns are mutually exclusive):
 
    **Pattern A — `backendConfig.username`/`password`** (e.g. `Dylan2011.WebHost.Deploy/stack/Jenkinsfile`,
    `mktdata-iam/Jenkinsfile`):
@@ -530,6 +546,53 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
    elsewhere in the same Jenkinsfile that pulls an *application* image (not the Terraform image) using
    a Jenkins credential — that's a separate, legitimate use of Docker Pipeline's own registry auth and
    is out of scope for this migration.
+
+   **Pattern D — an Artifactory credential bound via `withCredentials` for something other than
+   `dj-shared`'s `terraform()` step** (e.g. a plain `sh` step doing `curl`, `docker login`, `npm`
+   publish/install, or any other direct Artifactory call). This is the **only** Jenkinsfile pattern
+   that applies to most build-only projects, since a build-only Jenkinsfile commonly never calls
+   `terraform()` at all — don't conclude "nothing to migrate here" just because Patterns A-C don't
+   match; check for this one independently, in every `stage`, not just near any `terraform(...)` call:
+   ```groovy
+   // before
+   withCredentials([usernamePassword(credentialsId: 'artifactory_djsp_ro', usernameVariable: 'ARTIFACTORY_USR', passwordVariable: 'ARTIFACTORY_PSW')]) {
+     sh 'curl -u $ARTIFACTORY_USR:$ARTIFACTORY_PSW https://artifactory.dowjones.io/artifactory/api/search/pattern?pattern=...'
+   }
+   ```
+   ```groovy
+   // after
+   withArtifactoryOidcCredentials(scope: 'ro') {
+     sh 'curl -u $ARTIFACTORY_USR:$ARTIFACTORY_PSW https://artifactory.dowjones.io/artifactory/api/search/pattern?pattern=...'
+   }
+   ```
+   Key points, distinct from Patterns A-C:
+   - **Preserve the body untouched — only swap the wrapper.** `withArtifactoryOidcCredentials` takes
+     optional `usernameVariable`/`passwordVariable` parameters (defaulting to `ARTIFACTORY_USR`/
+     `ARTIFACTORY_PSW`) specifically so the script body inside the block needs zero edits: pass
+     whatever variable names the old `usernamePassword(...)` binding used, e.g.
+     `withArtifactoryOidcCredentials(usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')` if
+     the old binding didn't use the default names.
+   - **Scope selection (`ro` vs `rw`) is a judgment call — don't guess silently.** A credential ID or
+     usage that's clearly read-only (searching/downloading, e.g. `artifactory_djsp_ro`) maps to
+     `scope: 'ro'`; one that's clearly publishing/uploading (e.g. a credential ID containing `rw`,
+     `publish`, or `push`, or a script block doing `curl -X PUT`/`npm publish`) maps to `scope: 'rw'`.
+     If it's ambiguous from the credential ID and the script body alone, ask the user rather than
+     defaulting to one.
+   - **A single-value `string(...)` binding is not a 1:1 replacement** — if the old binding was
+     `string(credentialsId: '...', variable: 'ARTIFACTORY_TOKEN')` (a bare API-key/token var, not a
+     username+password pair) and the script body uses it as a single bearer-style value (e.g.
+     `-H "X-JFrog-Art-Api: $ARTIFACTORY_TOKEN"` or `-H "Authorization: Bearer $ARTIFACTORY_TOKEN"`),
+     `withArtifactoryOidcCredentials` still only produces a username+password pair — point the script
+     at the password variable as the bearer token (e.g. pass `passwordVariable: 'ARTIFACTORY_TOKEN'`
+     and leave the body's `Bearer $ARTIFACTORY_TOKEN` usage as-is) rather than silently assuming Basic
+     auth is fine to introduce in its place; confirm with the user if the body does anything with the
+     username side that doesn't translate (e.g. an `X-JFrog-Art-Api` header, which has no OIDC
+     equivalent at all — that header-based API-key scheme is gone entirely under OIDC, so a script
+     that specifically needs it has no direct replacement and must switch to Bearer-token or Basic
+     auth instead, which may require a change beyond this skill's Jenkinsfile-only scope).
+   - **Not exclusive to build-only/ECS** — an EC2-type repo's Jenkinsfile can independently have this
+     pattern too (e.g. a `stage` that curls Artifactory for something unrelated to the `terraform()`
+     call elsewhere in the same file). Check for it in every repo type, not just build-only/ECS ones.
 
 7. **Check `installer_config.installer.version` is pinned to CommonInstaller's current major-version
    wildcard, not a stale one:**
@@ -811,14 +874,16 @@ old static-secret pattern needs item 5 only — none of items 1-4.)*
    ARN (not the alias) before trusting that `terraform plan` passing means the grant actually works.
 
 4. **Clean up the IAM repo's own Jenkinsfile(s) the same way as Step 4, item 6** — same gating
-   check against `vars/terraform.groovy` (a confirmed-OIDC-aware result for the deploy repo's
-   Jenkinsfile applies here too if both pin the same org-default library with no explicit ref;
-   re-check if either pins its own), same three patterns (A: `backendConfig.username`/`password`,
-   B: `backendConfig.token`, C: `docker.credential`), same rule to only remove the Artifactory
-   credential binding and leave unrelated bindings in a shared `withCredentials([...])` alone. Do
-   this for every Jenkinsfile found in Step 7's discovery, not just one. This is easy to skip
-   entirely because the rest of the IAM repo migration is pure Terraform — don't let that pattern
-   match fool you into thinking the Jenkinsfile layer doesn't apply here too.
+   checks against `vars/terraform.groovy` and `vars/withArtifactoryOidcCredentials.groovy` (a
+   confirmed-OIDC-aware result for the deploy repo's Jenkinsfile applies here too if both pin the
+   same org-default library with no explicit ref; re-check if either pins its own), same four
+   patterns (A: `backendConfig.username`/`password`, B: `backendConfig.token`, C: `docker.credential`,
+   D: any other `withCredentials`-bound Artifactory credential wrapping a non-`terraform()` script
+   block), same rule to only remove the Artifactory credential binding and leave unrelated bindings in
+   a shared `withCredentials([...])` alone. Do this for every Jenkinsfile found in Step 7's discovery,
+   not just one. This is easy to skip entirely because the rest of the IAM repo migration is pure
+   Terraform — don't let that pattern match fool you into thinking the Jenkinsfile layer doesn't apply
+   here too.
 
 5. **ECS image-pull secret exception only** (see "EC2 vs ECS/build-only" above and Step 4, item 8) —
    grant the ECS task **execution** role read access to Platform Engineering's managed pull secret and
@@ -1130,6 +1195,8 @@ effect for this session.
 | Role already has an `extra_ro_mappings` entry in that account (Step 11) | Skip that account, note it, move on — don't duplicate |
 | Account not yet onboarded in `accounts/iam-federation/prod/variables.tf`'s `var.accounts` (Step 11) | Stop and tell the user to route it to Platform Engineering — this skill doesn't onboard new accounts (needs a captured `issuer_url` it has no way to obtain) |
 | Jenkinsfile's pinned `dj-shared` ref does not yet reject all three of `backendConfig.username`/`password`, `backendConfig.token`, and `docker.credential` (Step 4, item 6; Step 8, item 4) | Don't remove any `withCredentials`/`backendConfig`/`docker.credential` wiring yet — flag it and ask about bumping the library ref, same as an unfixed shared EC2 module in Step 0 |
+| Jenkinsfile's pinned `dj-shared` ref does not yet have `vars/withArtifactoryOidcCredentials.groovy` (Pattern D's own gating check, Step 4, item 6; Step 8, item 4) | Leave that Pattern D candidate's `withCredentials` wiring in place even if Patterns A-C are otherwise safe to migrate on the same ref — it's a separate step added later; flag it and ask about bumping the ref |
+| A build-only Jenkinsfile has none of Patterns A-C (no `terraform()` call at all) | Don't conclude there's nothing to migrate — check for Pattern D independently; it's commonly the *only* applicable pattern for build-only projects |
 | Deploy repo's `instance_profile_name` matches a role already migrated for a sibling project this session | Skip Steps 7-11 entirely for this project — the IAM grant and RO registration already cover the shared role; do the deploy-repo Terraform/Jenkinsfile work only, and say in the commit/PR body which repo/PR already covers the IAM side |
 | Another OPEN PR against `dj-terraform-aws-artifactory-token-management` already uses the priority you were about to assign for the same account (Step 11, item 4a) | Pick a priority higher than every priority already used for that account across `main` *and* every other open PR — don't just take the next unused value on `main` |
 | Assuming a RO-registration PR is safe to leave alone because `gh pr view` showed `mergeable: MERGEABLE` right after pushing it | That status is computed against the base branch *at that moment* — it flips to `CONFLICTING` only once a sibling PR editing the same account's `extra_ro_mappings` list actually merges first. Re-check and fix then (Step 11, item 9), don't treat the push-time status as permanent |
@@ -1168,6 +1235,9 @@ effect for this session.
 | Assuming the deploying account shares the project's name (e.g. "dylan" account) | Many projects deploy into a shared-services account (e.g. `shdsvc`) used by multiple unrelated teams — don't guess from the project name |
 | Trusting the first account-ID-shaped locals map found in the IAM repo as "the deployment account mapping" (this has actually happened — see "Resolving the deploy account(s)" under Inputs) | Grep every place that map is *referenced*, not just where it's defined, before trusting it — it may build a cross-account ARN for an unrelated resource. The IAM repo's own Terraform frequently doesn't know its own deployment account at all (injected by CI); resolve the account from the deploy repo's backend/provider config or its shared module's landing-zone registry instead, and say the resolved account IDs back to the user before editing the third repo |
 | Stripping a Jenkinsfile's `backendConfig`/`docker` credential parameters before confirming the pinned `dj-shared` ref actually rejects all three (Step 4, item 6; Step 8, item 4) | Check first — older refs still require these parameters; removing them while pinned to one supplies no credentials where the old code path expected them and breaks the build, often on a *different* parameter than the one you were thinking of (e.g. `docker.credential` fails before `backendConfig.token` is ever reached, since that map is validated first) |
+| Applying Pattern D (`withArtifactoryOidcCredentials`) using the same gating check as Patterns A-C (`vars/terraform.groovy`'s "no longer supported" strings) | Pattern D is a different, independently-added step — check `vars/withArtifactoryOidcCredentials.groovy` exists at the pinned ref separately; a ref can be OIDC-aware for A-C and still predate Pattern D |
+| Assuming `withArtifactoryOidcCredentials` is a drop-in replacement for a single-value `string(...)` credential binding | It always produces a username+password pair, not a bare token var — for a script that uses the old binding as a single bearer value, point the body's existing variable name at the new step's `passwordVariable`; for `X-JFrog-Art-Api`-header usage there is no OIDC equivalent at all, so flag it rather than guessing a replacement |
+| Only looking for Pattern D near an existing `terraform()` call, or only in repos that already show Patterns A-C | Pattern D is independent of `terraform()` entirely and is often the *only* pattern present in a build-only Jenkinsfile — check every `stage` in every Jenkinsfile for an Artifactory-credentialed `withCredentials`, regardless of whether `terraform()` appears anywhere in the file |
 | Deleting an entire `withCredentials([...])` block because one of its bindings is now unused | Only remove the specific binding entry for the Artifactory credential; leave other, unrelated bindings (e.g. an Apollo key) alone and only unwrap the step if the list becomes empty |
 | Migrating the deploy repo's Jenkinsfile(s) (Step 4, item 6) and treating the IAM repo as Terraform-only, so its own Jenkinsfile keeps the same credential wiring | The IAM repo almost always has its own `Jenkinsfile` driving its own `terraform apply`, independent of the deploy repo's — always run Step 8, item 4 too; this has actually been missed in practice on a real migration (caught only after the fact, as a follow-up commit to the already-open IAM repo PR) |
 | Leaving `installer_config.installer.version` pinned to a stale major-version wildcard (e.g. `"2.1.*"`) | Check CommonInstaller's `build.ps1` `$version` on `develop` and bump to match (currently `"3.0.*"`) — a stale wildcard matches no currently-published package and breaks provisioning at boot, independent of whether the rest of the secrets-manager migration is otherwise already done (Step 4, item 7) |
