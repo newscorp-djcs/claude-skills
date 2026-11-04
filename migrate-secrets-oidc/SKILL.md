@@ -1,6 +1,6 @@
 ---
 name: migrate-secrets-oidc
-description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and static Artifactory credentials onto runtime AWS Secrets Manager fetch plus OIDC-based Artifactory auth — across the deploy repo, its IAM repo (grants sts:GetWebIdentityToken), and dj-terraform-aws-artifactory-token-management (registers the role for RO access, now mandatory since the account-wide RO catch-all was removed). For ECS-based or build-only deploy components (no CommonInstaller/installer_config, no separate runtime IAM identity outside Jenkins), scope narrows to Jenkinsfile-only dj-shared credential cleanup — no IAM/Artifactory changes needed. This covers both credentials fed into dj-shared's `terraform()` step (backendConfig.username/password, backendConfig.token, docker.credential) and, for build-only/ECS Jenkinsfiles that don't call `terraform()` at all, any other `withCredentials`-bound Artifactory credential wrapping an arbitrary script block (curl, docker login, npm, etc.) — replaced with dj-shared's `withArtifactoryOidcCredentials` step. Exception: if the ECS task definition itself still resolves its Artifactory image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (fed into `credentials_param_arn`/`repositoryCredentials`), that still needs a deploy-repo Terraform edit (hardcode Platform Engineering's managed pull-secret ARN, move the image to `dj-docker-virtual`) and an IAM-repo grant on the ECS task *execution* role — a different, narrower mechanism than the EC2 OIDC/RO-registration pattern. Use when asked to "migrate this project to the new secrets pattern", "move off the static Artifactory key", "apply the secrets-manager-runtime-fetch pattern", "update IAM for the new CommonInstaller secrets/OIDC flow", "register a role for Artifactory RO/OIDC access", "clean up the Jenkinsfile credentials for this ECS project", "remove Artifactory credentials from this build-only project", or "move this ECS task off the static Artifactory pull secret to the managed pull secret".
+description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and a static Artifactory key onto runtime AWS Secrets Manager fetch plus OIDC Artifactory auth, across the deploy repo, its IAM repo, and dj-terraform-aws-artifactory-token-management. For ECS/build-only components with no CommonInstaller, scope narrows to Jenkinsfile-only cleanup: replace withCredentials-bound Artifactory creds (terraform() backendConfig/docker.credential, or arbitrary curl/docker/npm blocks) with dj-shared's withArtifactoryOidcCredentials. Exception: an ECS task def pulling its image-pull credential via a dynamic aws_secretsmanager_secret lookup needs a Terraform edit (hardcode the managed pull-secret ARN) plus an IAM-repo grant on the task execution role. Use when asked to migrate to the new secrets pattern, drop a static Artifactory key, apply secrets-manager-runtime-fetch, update IAM for OIDC, register a role for Artifactory RO/OIDC, or clean up Jenkinsfile Artifactory credentials.
 ---
 
 # Migrate a deploy project to runtime Secrets Manager + OIDC Artifactory auth
@@ -87,6 +87,12 @@ pipeline with no deploy-target Terraform of its own, just a Jenkinsfile that bui
 artifact — follows the same reduced scope as ECS.
 
 ```bash
+# fast first check: a .servo manifest (or any other non-Terraform deploy-platform
+# descriptor) at the repo root is a strong, early build-only signal — Servo-managed
+# apps have no Terraform anywhere in the repo at all, EC2 or ECS
+ls .servo 2>/dev/null && echo "-> Servo-managed deploy: build-only, confirm no .tf files exist anywhere"
+find . -iname "*.tf" -not -path "*/.git/*" | head -1
+
 for d in infrastructure stack switch; do
   [ -d "$d" ] || continue
   echo "=== $d ==="
@@ -101,7 +107,7 @@ done
 |---|---|---|
 | **EC2** | `installer_config`/`addonPkg` present, or a module `source` referencing `dj-terracycle`'s `ec2_instance`/`ec2_stack`/`ec2_cluster` | Everything — Steps 0-11, as described below. |
 | **ECS** (Fargate) | No `installer_config`; a module `source` referencing `dj-terracycle`'s `ecs_service`/`host_match_rule`, or raw `aws_ecs_service`/`aws_ecs_task_definition` resources | **Jenkinsfile-only.** Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely — there's no `installer_config` to migrate and no separate runtime IAM identity needing the OIDC/secrets grant (that's handled inside Jenkins already). Only **Step 4, item 6** (Jenkinsfile credential cleanup), then Step 6 (commit) and Step 12 (hand off) for the deploy repo alone. No IAM repo involvement at all. **Exception — see below** if the task definition's image pull also uses the old static-secret pattern. |
-| **Build-only** (a CI pipeline with no deploy-target Terraform of its own) | No EC2/ECS Terraform at all; just a Jenkinsfile | Same as ECS — Jenkinsfile-only (Step 4, item 6), no IAM repo, no RO registration. |
+| **Build-only** (a CI pipeline with no deploy-target Terraform of its own) | No EC2/ECS Terraform at all; just a Jenkinsfile. A `.servo` manifest at the repo root (Servo-platform deploy, e.g. `{"platform": "docker", "tags": {...}}`) is a reliable positive signal for this — Servo-deployed apps carry zero Terraform anywhere in the repo, so finding `.servo` lets you skip straight to the Jenkinsfile-only scope without exhaustively grepping every folder for `*.tf` first. Still confirm with a repo-wide `find . -iname "*.tf"` coming up empty before committing to the classification. | Same as ECS — Jenkinsfile-only (Step 4, item 6), no IAM repo, no RO registration. |
 
 **If a repo has both EC2 and ECS/build-only components:** run the full flow (Steps 0-11) only
 against the EC2 component(s); run the Jenkinsfile-only flow against the ECS/build-only component(s)
@@ -164,7 +170,7 @@ Don't guess at any of these; ask the user if they aren't supplied or obvious fro
 | Local path to `dj-terraform-aws-artifactory-token-management` | Ask if not given, or search common dev roots for it | Needed for Step 11 |
 | Jenkinsfile(s) in the deploy repo | `find <deploy-repo> -iname Jenkinsfile` — don't assume there's only one; they're typically under `infrastructure/`, `stack/`, and `switch/` folders | Needed for Step 4, item 6 — **every one found must be checked and cleaned up independently**, not just the first |
 | Jenkinsfile(s) in the IAM repo | `find <iam-repo> -iname Jenkinsfile` — the IAM repo almost always has its own, driving its own `terraform apply`, entirely separate from the deploy repo's | Needed for Step 8, item 4 — same patterns as the deploy repo's Jenkinsfile(s), checked and cleaned up independently; easy to forget since the IAM repo migration is otherwise pure Terraform |
-| The `dj-shared` library ref each Jenkinsfile pins, if any | Grep each Jenkinsfile found above (deploy repo *and* IAM repo) for `@Library('dj-shared`; if no explicit `@<ref>` is given, the org-wide default library config applies — ask the user whether that default is already OIDC-aware, don't assume | Gates whether it's safe to strip the old credentials in Step 4, item 6 and Step 8, item 4 — check per repo, a confirmed-OIDC-aware default for one repo applies to all since it's the same org-wide library, but re-verify if either repo pins its own explicit ref |
+| The `dj-shared` library ref each Jenkinsfile pins, if any | Grep each Jenkinsfile found above (deploy repo *and* IAM repo) for `@Library('dj-shared`; if no explicit `@<ref>` is given (e.g. just `@Library("dj-shared") _`), the org-wide default library config applies. **This is checkable directly, not just askable** — run the same gating `gh api` call from Step 4 item 6 against `jenkins-pipeline-shared` with no `?ref=` query param at all (omitting it resolves to the repo's own default branch), which answers the OIDC-awareness question the same way a pinned ref would. Only fall back to asking the user if that lookup itself fails (no GHE access, repo renamed, etc.) | Gates whether it's safe to strip the old credentials in Step 4, item 6 and Step 8, item 4 — check per repo, a confirmed-OIDC-aware default for one repo applies to all since it's the same org-wide library, but re-verify if either repo pins its own explicit ref |
 
 ### Resolving the deploy account(s) — do not shortcut this
 
@@ -428,7 +434,10 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
 
    First confirm the gating condition for that Jenkinsfile — **don't skip this check**, since older `dj-shared` refs still
    require these parameters and removing them while pinned to one breaks the build outright (no
-   credentials at all would be supplied where the old code path expected them):
+   credentials at all would be supplied where the old code path expected them). If the Jenkinsfile
+   pins no explicit ref (just `@Library('dj-shared') _`), **omit `?ref=` entirely** rather than
+   stopping to ask the user — that resolves to the repo's own default branch and answers the same
+   question directly:
    ```bash
    gh api -H "Accept: application/vnd.github+json" \
      "https://github.dowjones.net/api/v3/repos/Infrastructure/jenkins-pipeline-shared/contents/vars/terraform.groovy?ref=<pinned-ref-or-default-branch>" \
