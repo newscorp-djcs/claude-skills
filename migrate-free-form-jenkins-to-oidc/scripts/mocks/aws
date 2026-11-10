@@ -1,0 +1,7 @@
+#!/bin/bash
+# Mock AWS CLI for verify-helpers.sh. Returns obviously fake values; nothing here is a real credential.
+[ -n "${MOCK_AWS_LOG:-}" ] && echo "$*" >> "$MOCK_AWS_LOG"
+case "$2" in
+  get-caller-identity) echo 123456789012 ;;
+  get-web-identity-token) echo 'MOCK-AWS-WEB-IDENTITY-TOKEN.NOT-REAL' ;;
+esac

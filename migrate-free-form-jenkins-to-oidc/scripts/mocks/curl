@@ -1,0 +1,10 @@
+#!/bin/bash
+# Mock JFrog OIDC token exchange. Reads the request body from stdin (as the helper sends it).
+# Returns an obviously fake token; only its middle part is real base64 JSON, because the helper
+# decodes it to read the username. FAIL_SCOPE=ro|rw makes that scope return an UNAUTHORIZED error.
+body=$(cat)
+echo "$body" | jq -e '.subject_token == "MOCK-AWS-WEB-IDENTITY-TOKEN.NOT-REAL"' >/dev/null || { echo '{"errors":[{"message":"bad request"}]}'; exit 0; }
+scope=$(echo "$body" | jq -r .provider_name | cut -d- -f3)
+[ "$scope" = "${FAIL_SCOPE:-none}" ] && { echo '{"errors":[{"code":"UNAUTHORIZED","message":"provider not found"}]}'; exit 0; }
+p=$(printf '{"sub":"jfac@01abc/users/aws-iam-%s-123456789012/role"}' "$scope" | base64 | tr -d '=\n' | tr '/+' '_-')
+echo "{\"access_token\":\"MOCK-ARTIFACTORY-TOKEN.$p.NOT-A-REAL-SIGNATURE\"}"
