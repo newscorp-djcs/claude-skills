@@ -3,6 +3,7 @@
 #   1) whole Jenkinsfile parses as Groovy   2) token + Basic-auth form are masked in output
 #   3) exit codes pass through              4) failed exchange stops before the script runs
 #   5) helper block has no calls that need Jenkins script approval
+#   6) both scopes mint a token, each with its own STS audience and JFrog provider (ro is the default)
 # Usage: verify-helpers.sh <path/to/Jenkinsfile>      Needs: groovy, bash, jq
 set -euo pipefail
 JF=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -55,10 +56,17 @@ println log
 if (log.contains('ARTSIGNATURE')) failures << 'raw token leaked'
 if (!log.contains('Authorization: Basic ****')) failures << 'Basic-auth header not masked'
 if (rc != 2) failures << "exit code not passed through (got ${rc})"
-try { shWithArtifactoryToken('ro', 'echo SHOULD_NOT_RUN'); failures << 'failed exchange did not stop' }
+captured = new ByteArrayOutputStream(); System.setOut(new PrintStream(captured, true))
+try { rc = shWithArtifactoryToken('ro', 'echo "RO_RAN"') } finally { System.setOut(orig) }
+log = captured.toString(); println log
+if (rc != 0 || !log.contains('RO_RAN')) failures << "ro script did not run (rc ${rc})"
+if (!log.contains("'ro' token for aws-iam-ro-")) failures << 'ro scope did not use the aws-iam-ro provider'
+def awsLog = new File(System.getenv('MOCK_AWS_LOG')).text
+['RO', 'RW'].each { if (!awsLog.contains("--audience DJ-Artifactory-${it}")) failures << "no STS call with audience DJ-Artifactory-${it}" }
+try { withEnv(['FAIL_SCOPE=ro']) { shWithArtifactoryToken('ro', 'echo SHOULD_NOT_RUN') }; failures << 'failed exchange did not stop' }
 catch (Stop e) { println "Expected failure: ${e.message}" }
-println(failures ? "VERIFY: FAILED ${failures}" : 'VERIFY: OK (masking, exit code, fail-closed)')
+println(failures ? "VERIFY: FAILED ${failures}" : 'VERIFY: OK (masking, exit code, ro and rw scopes, fail-closed)')
 if (failures) System.exit(1)
 G
 } > "$WORK/run.groovy"
-(cd "$WORK" && FAIL_SCOPE=ro groovy run.groovy)
+(cd "$WORK" && MOCK_AWS_LOG="$WORK/aws.log" groovy run.groovy)

@@ -1,6 +1,6 @@
 ---
 name: migrate-free-form-jenkins-to-oidc
-description: For Dow Jones CI/CD (Dow Jones Jenkins servers deploying Dow Jones GitHub repos against the Dow Jones Artifactory). Replace a static Artifactory Jenkins credential (withCredentials usernamePassword/UsernamePasswordMultiBinding/string) in a free-form scripted Jenkinsfile that does not use a shared pipeline library with short-lived Artifactory tokens minted at runtime from the Jenkins node's AWS identity (aws sts get-web-identity-token, then JFrog OIDC token exchange). Pastes a tested Groovy helper block that needs no extra Jenkins plugins and no script approval, masks the token in all console output (including set -x and TF_LOG=DEBUG/TRACE), and uses read-write tokens for the Terraform Artifactory state backend. Commits, pushes and opens the PR by default. Use when asked to move a scripted/free-form Jenkinsfile to OIDC or short-lived Artifactory tokens, or to remove the static Artifactory credential from one. Not for Jenkinsfiles that call a shared library's terraform() step (use the shared-library OIDC migration skill instead), and not for non-Dow Jones Jenkins or Artifactory instances.
+description: For Dow Jones Jenkins, GitHub and Artifactory. Replace a static Artifactory Jenkins credential (withCredentials usernamePassword/string) in a free-form scripted Jenkinsfile with no shared pipeline library with short-lived Artifactory tokens minted at runtime from the Jenkins node's AWS identity (aws sts get-web-identity-token, then JFrog OIDC token exchange). Uses a read-write token only when Terraform uses the Artifactory backend or the job uploads to Artifactory, and read-only otherwise. Pastes a tested Groovy helper block that needs no extra Jenkins plugins or script approval and masks the token in all console output (including set -x and TF_LOG=DEBUG/TRACE). Commits, pushes and opens the PR by default. Use when asked to move a scripted/free-form Jenkinsfile to OIDC or short-lived Artifactory tokens, or to remove its static Artifactory credential. Not for Jenkinsfiles that call a shared library's terraform() step (use the shared-library OIDC migration skill) or non-Dow Jones Jenkins/Artifactory.
 ---
 
 # Migrate a free-form Jenkinsfile to short-lived Artifactory tokens
@@ -91,13 +91,25 @@ Check these with the user before changing anything, and repeat them in the final
 
 ## Choosing the scope (RO vs RW)
 
+**Use read-only (`ro`) by default.** Use read-write (`rw`) only in these two cases:
+
+1. **Terraform uses Artifactory as its backend** (`backend "artifactory"` in the `.tf` files the job runs).
+2. **The Jenkins job uploads to Artifactory**, for example by publishing a package, pushing an image or
+   deploying a build artifact.
+
+Everything else gets `ro`. Choose the scope for each call site, not for the whole job. In a job that
+uses the Terraform backend, a separate `curl` download still gets `ro`. If a single script both
+downloads and uploads, it gets `rw`.
+
 | Credential use | Scope |
 |---|---|
 | Terraform `backend "artifactory"`: every backend command (`init`, `plan`, `apply`, `destroy`, `import`, `state *`) | **`rw`**. State is read and written on every run, so don't split it into RO for plan and RW for apply. |
-| Upload or publish: `curl -X PUT`, `jf rt upload`, `npm publish`, `docker push` | `rw` |
-| Download only: `curl` GET, `npm install`, `pip install`, `docker pull` | `ro` |
+| Upload or publish: `curl -X PUT`/`-T`, `jf rt upload`, `npm publish`, `docker push`, `mvn deploy`, `gradle publish`, `twine upload`, `helm push` | **`rw`** |
+| Everything else, for example downloads: `curl` GET, `jf rt download`, `npm install`, `pip install`, `docker pull`, Terraform provider or module downloads with a non-Artifactory backend | `ro` |
 
-If a use is unclear, ask the user. The helper derives the token settings from the scope:
+If you can't tell whether a call site uploads, ask the user instead of choosing `rw` to be safe.
+If you choose `rw`, say which of the two cases applies, both in the PR body and in the report. The
+helper derives the token settings from the scope:
 
 | | RO | RW |
 |---|---|---|
@@ -139,7 +151,10 @@ Behavior to tell the user about:
    the shared-library OIDC migration skill described above. Confirm the job targets the Dow Jones setup (the Dow Jones
    Artifactory host, an Artifactory credential bound with `credentialsId`, a Dow Jones Jenkins server).
    If it doesn't, stop and ask the user before going further.
-3. **Classify** each credential use as `rw` or `ro` using the table above, and confirm the prerequisites.
+3. **Classify each call site.** Choose `rw` only if it runs a Terraform command against an
+   `artifactory` backend or uploads to Artifactory. Otherwise choose `ro` (see "Choosing the scope").
+   Check the `.tf` files for the backend type rather than assuming it. Confirm the prerequisites,
+   including that the node role is registered for every scope you chose.
 4. **Paste the helper block.** Copy all of `scripts/artifactory-oidc-helpers.groovy`, including the
    `// BEGIN Artifactory` and `// END Artifactory` marker lines, which the verifier needs. Paste it as is,
    with no added comments. Put it after the existing helper functions and before the first function
@@ -166,6 +181,9 @@ Behavior to tell the user about:
    def exitCode = shWithArtifactoryToken('rw', execInit)
    ...
    ```
+   This example uses `rw` because the Terraform backend is Artifactory. A call site that only downloads,
+   for example `curl -u "\$ARTIFACTORY_USERNAME:\$ARTIFACTORY_PASSWORD" -O <artifact-url>`, uses
+   `shWithArtifactoryToken('ro', ...)`.
    - **Route every backend command through the helper** (`init`, `plan`, `apply plan.out`,
      `destroy`, `import.sh`, `terraform state ...`), not only `init`. A function may run `plan` more
      than once, for example a second run that captures output; route each one. `validate`, `fmt` and
@@ -188,7 +206,8 @@ Behavior to tell the user about:
    ```
    The verifier checks that the Jenkinsfile parses and that the block has no calls needing script
    approval. It then runs the block with stubbed Jenkins steps and mocked `aws`/`curl`, and confirms
-   that the token and Basic-auth form are masked, that exit codes come through, and that a failed
+   that the token and Basic-auth form are masked, that exit codes come through, that both `ro` and `rw`
+   mint a token with their own STS audience and JFrog provider, and that a failed
    exchange stops before the script runs. Look for `VERIFY: OK` in its output. This is not a Jenkins
    run, so say that when you report.
 7. **Commit, push and open the PR.** Do this by default as soon as step 6 passes; don't stop to ask.
@@ -204,13 +223,13 @@ Behavior to tell the user about:
    - **If the SSH push fails** with `Permission denied (publickey)` and `gh` is logged in, push over
      HTTPS with gh's credentials without changing git config:
      `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/<org>/<repo>.git feature/oidc-artifactory-migration`
-   - **PR body:** a summary, the call-site table (function, command, change), the prerequisites (name
+   - **PR body:** a summary, the call-site table (function, command, scope, reason for `rw`, change), the prerequisites (name
      the Jenkins node labels the job uses), the behavior changes and the testing done. Say plainly
      that the testing was offline and that no Jenkins run has happened yet. End it with the session's
      PR attribution line.
    - **Several repos:** write the body to a file outside the repos, adapt it per repo when the call
      sites differ, and open one PR per repo.
-8. **Report.** Give the PR URL(s), each call site with its scope, the credential removed, what was
+8. **Report.** Give the PR URL(s), each call site with its scope (and, for `rw`, which case applies), the credential removed, what was
    verified, the prerequisites and the behavior notes above. Recommend a `plan` run first, then one
    with `TF_LOG=DEBUG` to confirm masking. If the user asked to review first, report the uncommitted
    diff instead and open the PR when they approve.
@@ -225,3 +244,4 @@ Behavior to tell the user about:
 | `getArtifactoryToken: unexpected output from aws sts` | The STS call printed something other than a token. Run the same `aws sts` command on that node. |
 | `No Artifactory 'rw' token returned: ...` | JFrog rejected the exchange. Usually the `aws-iam-<scope>-<accountId>` provider is missing or the role is not registered for that scope (prerequisite 3). |
 | Terraform backend `401` or `403` | Wrong scope (use `rw` for state), or the username doesn't match the token's `sub`. Don't override `ARTIFACTORY_USERNAME`. |
+| `403` on an upload or publish | The call site uses `ro`. Switch it to `rw` and make sure the node role is registered with the `aws-iam-rw-<accountId>` provider. |
