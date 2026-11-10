@@ -1,0 +1,9 @@
+#!/bin/bash
+# Mock JFrog OIDC token exchange. Reads the request body from stdin (as the helper sends it).
+# FAIL_SCOPE=ro|rw makes that scope return an UNAUTHORIZED error.
+body=$(cat)
+echo "$body" | jq -e '.subject_token|startswith("eyJ")' >/dev/null || { echo '{"errors":[{"message":"bad request"}]}'; exit 0; }
+scope=$(echo "$body" | jq -r .provider_name | cut -d- -f3)
+[ "$scope" = "${FAIL_SCOPE:-none}" ] && { echo '{"errors":[{"code":"UNAUTHORIZED","message":"provider not found"}]}'; exit 0; }
+p=$(printf '{"sub":"jfac@01abc/users/aws-iam-%s-123456789012/role"}' "$scope" | base64 | tr -d '=\n' | tr '/+' '_-')
+echo "{\"access_token\":\"eyJ2ZXIiOiIyIn0.$p.ARTSIGNATURE-abc_def\"}"

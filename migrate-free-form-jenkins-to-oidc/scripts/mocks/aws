@@ -1,0 +1,5 @@
+#!/bin/bash
+case "$2" in
+  get-caller-identity) echo 123456789012 ;;
+  get-web-identity-token) echo 'eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJESSJ9.AWSJWTSIG' ;;
+esac
