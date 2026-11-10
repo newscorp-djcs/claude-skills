@@ -53,7 +53,8 @@ try {
 } finally { System.setOut(orig) }
 def log = captured.toString()
 println log
-if (log.contains('ARTSIGNATURE')) failures << 'raw token leaked'
+if (log.contains('NOT-A-REAL-SIGNATURE')) failures << 'raw Artifactory token leaked'
+if (log.contains('MOCK-AWS-WEB-IDENTITY-TOKEN')) failures << 'AWS web identity token leaked'
 if (!log.contains('Authorization: Basic ****')) failures << 'Basic-auth header not masked'
 if (rc != 2) failures << "exit code not passed through (got ${rc})"
 captured = new ByteArrayOutputStream(); System.setOut(new PrintStream(captured, true))
