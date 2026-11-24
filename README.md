@@ -28,6 +28,10 @@ Or from a shell, without starting a session:
 claude plugin marketplace add newscorp-djcs/claude-skills
 ```
 
+This only registers the catalog — no skill is installed or usable yet. If
+you run `/reload-plugins` right now, `0 plugins` is the correct result, not
+an error; you still need step 2 below.
+
 **2. Install a plugin:**
 
 ```
@@ -43,10 +47,30 @@ claude plugin install migrate-secrets-oidc@claude-skills
 You'll be asked to pick a scope — user (every project on this machine),
 project (shared with collaborators via `.claude/settings.json`), or local
 (this repo only, just for you). User scope is the usual choice for these
-skills.
+skills, and it's also the default when running non-interactively (no TTY,
+e.g. scripted installs), so a scriptable call doesn't need `-s user` unless
+you want a different scope.
+
+Tip: from a shell, you can skip step 1 entirely and do both steps in one
+command — `--marketplace` adds the marketplace first if it isn't already
+known:
+
+```bash
+claude plugin install migrate-secrets-oidc --marketplace newscorp-djcs/claude-skills
+```
 
 **3. Confirm it loaded:** type `/` in a session and look for
 `/migrate-secrets-oidc:migrate-secrets-oidc`, or run `claude plugin list`.
+
+### Troubleshooting
+
+**"I added the marketplace and ran `/reload-plugins` but nothing shows
+up."** This is expected, not a bug: `/plugin marketplace add` only
+registers the catalog of available plugins, it doesn't install any of
+them. `/reload-plugins` reloads whatever is already enabled — with nothing
+installed yet, there's nothing for it to find. Run step 2
+(`/plugin install migrate-secrets-oidc@claude-skills`) to actually install
+the plugin, then `/reload-plugins` will have something to pick up.
 
 To add a new plugin later, add its folder under this repo root with its own
 `.claude-plugin/plugin.json` (or a bare `SKILL.md` at the folder root), then
