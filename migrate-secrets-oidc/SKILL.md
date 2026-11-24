@@ -193,6 +193,27 @@ change, especially for `rw`:
    (`extra_rw_mappings`), tell the user to confirm with Platform Engineering **before the PR merges**.
    Do **not** edit `extra_rw_mappings` or any other registration as part of this flow.
 
+### Pre-edit checkpoint — show the plan, then wait
+
+After discovery and the gating checks, and **before touching any file or creating the branch**, present
+one short summary and wait for the user to confirm. "Report what you find" in Step 1 is not enough on
+its own — the point is to show the exact edits you intend to make so they can be corrected cheaply:
+
+- **Classification:** build-only code repo, and which steps are being skipped.
+- **Files found:** every Jenkinsfile and sourced script checked, and which Artifactory bindings each has
+  (or "none").
+- **Proposed change per stage:** old binding → new `withArtifactoryOidcCredentials(...)` call, the
+  scope chosen (`ro`/`rw`) and why, and the `usernameVariable`/`passwordVariable` names being kept.
+- **Left alone:** unrelated bindings (e.g. `ACF_PRO_KEY`) and out-of-scope files.
+- **Base branch** and the **gating-check result** (library ref checked, step present or missing).
+- **Open item:** the Jenkins node-role registration for the scope in use (previous section) — not yet
+  verified unless you actually verified it.
+
+**Skip the confirmation only if the user has already said to proceed without it** (e.g. "go ahead
+without confirming", or a batch run across many repos). If they did, still print the same summary as
+you go, so it is on record. This checkpoint is separate from the push/PR confirmation in Step 12 — both
+apply.
+
 ### Validation and hand-off
 
 - Brace balance and `grep -n "withCredentials" <Jenkinsfile>` (remaining hits should be non-Artifactory
