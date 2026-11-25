@@ -86,4 +86,14 @@ auto-refresh) — no need to re-add the marketplace.
 ```
 
 This refreshes the catalog and updates any plugin from it you've already
-installed.
+installed. Then start a new session or run `/reload-plugins`. If a plugin still
+shows its old version, run `/plugin update <plugin>@claude-skills`, or
+uninstall and reinstall it.
+
+**Maintainers: bump `version` on every change users should receive.** Claude
+Code decides whether an installed plugin is out of date from the `version` in
+`<plugin>/.claude-plugin/plugin.json`. If you change a plugin's files but leave
+the version alone, people who already installed it can be told they're up to
+date and keep running the cached copy. Use a minor bump (`1.0.0` → `1.1.0`)
+for new capability, a patch bump (`1.1.0` → `1.1.1`) for wording fixes. Merging
+to `main` is the publish step; there are no tags or CI to run.
