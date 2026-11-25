@@ -58,6 +58,14 @@ Depending on how a deploy component is classified, the skill can span up to
 | **IAM repo** (commonly `mktdata-iam`, but confirm — never assume) | Grants the EC2 instance role `sts:GetWebIdentityToken` and any needed Secrets Manager/KMS access; same Jenkinsfile cleanup as the deploy repo, independently | EC2-based components only — skipped entirely for ECS/build-only |
 | **`dj-terraform-aws-artifactory-token-management`** | Registers the role as an `extra_ro_mappings` entry so its OIDC token exchange actually succeeds (the account-wide RO catch-all was removed 2026-10-29) | EC2-based components only |
 
+### CommonInstaller branch default (IBD EC2 deploy repos)
+
+For IBD deploy repos, `stack/Jenkinsfile` has a `switch (currentLandingZone)` block that picks the
+CommonInstaller branch per environment (`commonInstallerBranch`). The skill sets it to `master` in every
+case (nonprod, stag, prod, default), leaving `defaultDeployBranch` (the deploy repo's own branch)
+alone. It checks that CommonInstaller's `master` already has the OIDC pattern first, and skips quietly
+if the block isn't there. See Step 4, item 7a in `SKILL.md`.
+
 ### Code repositories (app repos with a build Jenkinsfile)
 
 An application repo whose `ci-cd/Jenkinsfile` (or root/other-subdirectory Jenkinsfile) builds and
