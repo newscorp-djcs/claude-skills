@@ -171,6 +171,7 @@ Jenkinsfile with **no** `@Library(...)` can't use `withArtifactoryOidcCredential
 | Base branch | Ask — don't assume `develop`. Many code repos use `master`/`main` plus `release/*` branches. Check `git symbolic-ref refs/remotes/origin/HEAD` and recent merge history. |
 | Dominant pattern | Almost always **Pattern D** (no `terraform()` call). Common shapes: `Artifactory.newServer(...)` + `server.upload`/`download`, `curl -u`, `docker login`, `npm`/`composer` config. Patterns A-C only apply if a `terraform()` call is present. |
 | Scope (`ro` vs `rw`) | Publish/upload stages (`server.upload`, `curl -X PUT`, `npm publish`, credential IDs ending `_rw`) → `scope: 'rw'`. Download/resolve only → `'ro'`. If one Jenkinsfile has both, use one wrapper per stage, each with its own scope. Tell the user which you chose and why. |
+| `rw-immutable` | `withArtifactoryOidcCredentials` also supports `scope: 'rw-immutable'` (write **without** delete/overwrite), intended for version publishes that must never be replaced — e.g. a path containing a unique `BUILD_NUMBER`. It is the least-privilege fit for those, but start with plain `rw` (matches the old `_rw` credential, known to work) and offer `rw-immutable` as a follow-up the user tries on a second feature-branch build. Confirm the upload **and** any `props` annotation (`server.upload` specs with `"props"`) still succeed before keeping it. Not for stages that overwrite a moving tag such as `latest`. |
 | Unrelated bindings | Leave non-Artifactory bindings (e.g. `ACF_PRO_KEY`, SSH keys) alone, even when they sit in a sibling `withCredentials` in the same file. |
 | Container stages | If the credential is bound **outside** a `docker.image(...).inside(...)` block and the script runs inside it, keep the wrapper enclosing the whole `docker.image(...)` call so the env vars reach the container (`inside` forwards `withEnv` variables). Don't move bindings across the container boundary without checking. |
 
@@ -192,6 +193,12 @@ change, especially for `rw`:
    `iam-oidc-artifactory-token-consumer-guide.md` / `accounts/iam-federation/prod/variables.tf`
    (`extra_rw_mappings`), tell the user to confirm with Platform Engineering **before the PR merges**.
    Do **not** edit `extra_rw_mappings` or any other registration as part of this flow.
+
+The first feature-branch build is itself the verification. `withArtifactoryOidcCredentials` prints an
+`Artifactory OIDC token exchange: scope=<scope>, ... provider_name=aws-iam-<ro|rw>-<account>,
+token_sub=<node role ARN>` line at the start of the stage — its presence means the exchange (and so the
+node role's registration for that scope) worked, and a failure here is a registration problem, not a
+Jenkinsfile problem. The token itself is masked in the log; only claims are printed.
 
 ### Pre-edit checkpoint — show the plan, then wait
 
@@ -222,6 +229,13 @@ apply.
   through the publish/download stage** — ask the user to run it, or confirm they will, before merge.
   The artifact path often embeds the branch name (e.g. `${gitbranchname}/${appName}-v1.0.${BUILD_NUMBER}.tgz`),
   so a feature-branch build is naturally isolated from release artifacts.
+- **Reading the build log.** The stage should show the `Artifactory OIDC token exchange: scope=...`
+  line, then the plugin's `Deploying artifact: <url>` line, and the build should finish `SUCCESS` — a
+  401/403 makes `artifactoryUpload` throw, so a green build means the upload was accepted. The log does
+  not print an explicit "deployment succeeded", so also confirm the file exists (and its properties) in
+  Artifactory. `Failed sending usage report to Artifactory: ... Could not get Artifactory version`
+  is non-fatal plugin noise, common when `Artifactory.newServer(url: ...)` points at a repo subpath rather
+  than the Artifactory root; compare against a pre-migration build's log before deciding it is new.
 - Report: Jenkinsfile(s) changed, scope chosen per stage and why, Jenkins credential IDs now unused
   (cleanup candidates such as `artifactory_djsp_rw` — verify no other repo still uses them before
   anyone deletes them), and the identity-registration status from the previous section. Commit locally;
