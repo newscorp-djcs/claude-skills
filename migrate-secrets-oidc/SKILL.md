@@ -1,6 +1,6 @@
 ---
 name: migrate-secrets-oidc
-description: Migrate a CommonInstaller-based EC2 deploy project off plaintext/Terraform-resolved secrets and a static Artifactory key onto runtime AWS Secrets Manager fetch plus OIDC Artifactory auth, across the deploy repo, its IAM repo, and dj-terraform-aws-artifactory-token-management. For ECS/build-only components with no CommonInstaller, scope narrows to Jenkinsfile-only cleanup: replace withCredentials-bound Artifactory creds (terraform() backendConfig/docker.credential, or arbitrary curl/docker/npm blocks) with dj-shared's withArtifactoryOidcCredentials. Exception: an ECS task def pulling its image-pull credential via a dynamic aws_secretsmanager_secret lookup needs a Terraform edit (hardcode the managed pull-secret ARN) plus an IAM-repo grant on the task execution role. Use when asked to migrate to the new secrets pattern, drop a static Artifactory key, apply secrets-manager-runtime-fetch, update IAM for OIDC, register a role for Artifactory RO/OIDC, or clean up Jenkinsfile Artifactory credentials.
+description: Migrate a CommonInstaller-based EC2 deploy project off Terraform-resolved secrets and a static Artifactory key onto runtime AWS Secrets Manager fetch plus OIDC Artifactory auth, across the deploy repo, its IAM repo, and dj-terraform-aws-artifactory-token-management. For ECS/build-only components with no CommonInstaller, scope narrows to Jenkinsfile-only cleanup: replace withCredentials-bound Artifactory creds (terraform() backendConfig/docker.credential, or arbitrary curl/docker/npm blocks) with dj-shared's withArtifactoryOidcCredentials. Exception: an ECS task def pulling its image-pull credential via a dynamic aws_secretsmanager_secret lookup needs a Terraform edit (hardcode managed pull-secret ARN) plus an IAM-repo grant on the task execution role. Use when asked to migrate to the new secrets pattern, drop a static Artifactory key, apply secrets-manager-runtime-fetch, update IAM for OIDC, register a role for Artifactory RO/OIDC, or clean up Jenkinsfile Artifactory credentials (deploy or code repos).
 ---
 
 # Migrate a deploy project to runtime Secrets Manager + OIDC Artifactory auth
@@ -106,8 +106,8 @@ done
 | Component type | Detection | What applies |
 |---|---|---|
 | **EC2** | `installer_config`/`addonPkg` present, or a module `source` referencing `dj-terracycle`'s `ec2_instance`/`ec2_stack`/`ec2_cluster` | Everything — Steps 0-11, as described below. |
-| **ECS** (Fargate) | No `installer_config`; a module `source` referencing `dj-terracycle`'s `ecs_service`/`host_match_rule`, or raw `aws_ecs_service`/`aws_ecs_task_definition` resources | **Jenkinsfile-only.** Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely — there's no `installer_config` to migrate and no separate runtime IAM identity needing the OIDC/secrets grant (that's handled inside Jenkins already). Only **Step 4, item 6** (Jenkinsfile credential cleanup), then Step 6 (commit) and Step 12 (hand off) for the deploy repo alone. No IAM repo involvement at all. **Exception — see below** if the task definition's image pull also uses the old static-secret pattern. |
-| **Build-only** (a CI pipeline with no deploy-target Terraform of its own) | No EC2/ECS Terraform at all; just a Jenkinsfile. A `.servo` manifest at the repo root (Servo-platform deploy, e.g. `{"platform": "docker", "tags": {...}}`) is a reliable positive signal for this — Servo-deployed apps carry zero Terraform anywhere in the repo, so finding `.servo` lets you skip straight to the Jenkinsfile-only scope without exhaustively grepping every folder for `*.tf` first. Still confirm with a repo-wide `find . -iname "*.tf"` coming up empty before committing to the classification. | Same as ECS — Jenkinsfile-only (Step 4, item 6), no IAM repo, no RO registration. |
+| **ECS** (Fargate) | No `installer_config`; a module `source` referencing `dj-terracycle`'s `ecs_service`/`host_match_rule`, or raw `aws_ecs_service`/`aws_ecs_task_definition` resources | **Jenkinsfile-only.** Skip Steps 0-3, Step 4 items 1-5, 7 and 7a, Step 5, and Steps 7-11 entirely — there's no `installer_config` to migrate and no separate runtime IAM identity needing the OIDC/secrets grant (that's handled inside Jenkins already). Only **Step 4, item 6** (Jenkinsfile credential cleanup), then Step 6 (commit) and Step 12 (hand off) for the deploy repo alone. No IAM repo involvement at all. **Exception — see below** if the task definition's image pull also uses the old static-secret pattern. |
+| **Build-only** (a CI pipeline with no deploy-target Terraform of its own — includes application/code repos, see "Code repositories" below) | No EC2/ECS Terraform at all; just a Jenkinsfile. A `.servo` manifest at the repo root (Servo-platform deploy, e.g. `{"platform": "docker", "tags": {...}}`) is a reliable positive signal for this — Servo-deployed apps carry zero Terraform anywhere in the repo, so finding `.servo` lets you skip straight to the Jenkinsfile-only scope without exhaustively grepping every folder for `*.tf` first. Still confirm with a repo-wide `find . -iname "*.tf"` coming up empty before committing to the classification. | Same as ECS — Jenkinsfile-only (Step 4, item 6), no IAM repo, no RO registration. |
 
 **If a repo has both EC2 and ECS/build-only components:** run the full flow (Steps 0-11) only
 against the EC2 component(s); run the Jenkinsfile-only flow against the ECS/build-only component(s)
@@ -150,6 +150,119 @@ skipped; this exception adds exactly two items, nothing more.
 
 ---
 
+## Code repositories (app repos with a build Jenkinsfile)
+
+A **code repository** is an application repo (not a deploy repo) whose Jenkinsfile builds, tests and
+publishes an artifact — typically `ci-cd/Jenkinsfile`, but it may live at the repo root or another
+subdirectory. It has no deploy-target Terraform, so it is a **build-only** component: scope is
+**Jenkinsfile-only (Step 4, item 6) → Step 6 (commit) → Step 12 (hand off)**. Skip Steps 0-3, 5 and
+7-11 entirely — no IAM repo, no RO registration, no `installer_config`. Everything in Step 4, item 6
+(gating checks, Patterns A-D, brace-balance check, "leave unrelated bindings alone") applies unchanged;
+this section only covers what differs from a deploy repo.
+
+**Routing:** this skill is for Jenkinsfiles that load `@Library('dj-shared')`. A scripted/free-form
+Jenkinsfile with **no** `@Library(...)` can't use `withArtifactoryOidcCredentials` at all — use the
+`migrate-free-form-jenkins-to-oidc` skill instead, if it is installed.
+
+| Topic | Code repo behavior |
+|---|---|
+| Finding Jenkinsfiles | `find . -iname 'Jenkinsfile*' -not -path './node_modules/*'` — don't restrict the search to `infrastructure/`, `stack/`, `switch/`. Check every one independently. |
+| Sourced scripts | A Jenkinsfile often delegates to scripts (`. ./ci-cd/jenkins_build.sh`). `grep -rniE 'artifactory' <dir-of-jenkinsfile>/` — a bound credential may be consumed inside those scripts via env vars. The script body must keep working unchanged, so pass the variable names it reads via `usernameVariable`/`passwordVariable` rather than editing the script. Scripts not referenced by the active Jenkinsfile are out of scope (see Common mistakes). |
+| Base branch | Ask — don't assume `develop`. Many code repos use `master`/`main` plus `release/*` branches. Check `git symbolic-ref refs/remotes/origin/HEAD` and recent merge history. |
+| Dominant pattern | Almost always **Pattern D** (no `terraform()` call). Common shapes: `Artifactory.newServer(...)` + `server.upload`/`download`, `curl -u`, `docker login`, `npm`/`composer` config. Patterns A-C only apply if a `terraform()` call is present. |
+| Scope (`ro` vs `rw`) | Publish/upload stages (`server.upload`, `curl -X PUT`, `npm publish`, credential IDs ending `_rw`) → `scope: 'rw'`. Download/resolve only → `'ro'`. If one Jenkinsfile has both, use one wrapper per stage, each with its own scope. Tell the user which you chose and why. |
+| `rw-immutable` | `withArtifactoryOidcCredentials` also supports `scope: 'rw-immutable'` (write **without** delete/overwrite), intended for version publishes that must never be replaced — e.g. a path containing a unique `BUILD_NUMBER`. It is the least-privilege fit for those, but start with plain `rw` (matches the old `_rw` credential, known to work) and offer `rw-immutable` as a follow-up the user tries on a second feature-branch build. Confirm the upload **and** any `props` annotation (`server.upload` specs with `"props"`) still succeed before keeping it. Not for stages that overwrite a moving tag such as `latest`. |
+| Unrelated bindings | Leave non-Artifactory bindings (e.g. `ACF_PRO_KEY`, SSH keys) alone, even when they sit in a sibling `withCredentials` in the same file. |
+| Container stages | If the credential is bound **outside** a `docker.image(...).inside(...)` block and the script runs inside it, keep the wrapper enclosing the whole `docker.image(...)` call so the env vars reach the container (`inside` forwards `withEnv` variables). Don't move bindings across the container boundary without checking. |
+
+### Is the Jenkins identity actually registered for this scope? Verify, don't assume
+
+Unlike EC2, a code repo's Artifactory OIDC exchange runs as the **Jenkins node's own AWS identity**, so
+the migration only works if that identity is already set up — this skill doesn't (and for code repos
+shouldn't) set it up. The prerequisites are platform-managed and normally already in place for shared
+Jenkins, but they are the usual cause of a runtime failure after an otherwise-correct Jenkinsfile
+change, especially for `rw`:
+
+1. The node IAM role has `sts:GetWebIdentityToken` (and outbound web-identity federation is enabled in
+   that account).
+2. The node role is registered in `dj-terraform-aws-artifactory-token-management` for **every scope
+   the Jenkinsfile now uses** (`aws-iam-ro-<account>` / `aws-iam-rw-<account>` providers). A role
+   registered for `ro` only will fail a `rw` publish stage with an HTTP 401/403 at upload time, not at
+   the wrapper.
+3. If the `rw` scope can't be confirmed from that repo's
+   `iam-oidc-artifactory-token-consumer-guide.md` / `accounts/iam-federation/prod/variables.tf`
+   (`extra_rw_mappings`), tell the user to confirm with Platform Engineering **before the PR merges**.
+   Do **not** edit `extra_rw_mappings` or any other registration as part of this flow.
+
+The first feature-branch build is itself the verification. `withArtifactoryOidcCredentials` prints an
+`Artifactory OIDC token exchange: scope=<scope>, ... provider_name=aws-iam-<ro|rw>-<account>,
+token_sub=<node role ARN>` line at the start of the stage — its presence means the exchange (and so the
+node role's registration for that scope) worked, and a failure here is a registration problem, not a
+Jenkinsfile problem. The token itself is masked in the log; only claims are printed.
+
+### Pre-edit checkpoint — show the plan, then wait
+
+After discovery and the gating checks, and **before touching any file or creating the branch**, present
+one short summary and wait for the user to confirm. "Report what you find" in Step 1 is not enough on
+its own — the point is to show the exact edits you intend to make so they can be corrected cheaply:
+
+- **Classification:** build-only code repo, and which steps are being skipped.
+- **Files found:** every Jenkinsfile and sourced script checked, and which Artifactory bindings each has
+  (or "none").
+- **Proposed change per stage:** old binding → new `withArtifactoryOidcCredentials(...)` call, the
+  scope chosen (`ro`/`rw`) and why, and the `usernameVariable`/`passwordVariable` names being kept.
+- **Left alone:** unrelated bindings (e.g. `ACF_PRO_KEY`) and out-of-scope files.
+- **Base branch** and the **gating-check result** (library ref checked, step present or missing).
+- **Open item:** the Jenkins node-role registration for the scope in use (previous section) — not yet
+  verified unless you actually verified it.
+
+**Skip the confirmation only if the user has already said to proceed without it** (e.g. "go ahead
+without confirming", or a batch run across many repos). If they did, still print the same summary as
+you go, so it is on record. This checkpoint is separate from the push/PR confirmation in Step 12 — both
+apply.
+
+### Validation and hand-off
+
+- Brace balance and `grep -n "withCredentials" <Jenkinsfile>` (remaining hits should be non-Artifactory
+  only), per Step 4, item 6.
+- There is no Terraform to `fmt`/`validate`. The real test is a **Jenkins build of the feature branch
+  through the publish/download stage** — ask the user to run it, or confirm they will, before merge.
+  The artifact path often embeds the branch name (e.g. `${gitbranchname}/${appName}-v1.0.${BUILD_NUMBER}.tgz`),
+  so a feature-branch build is naturally isolated from release artifacts.
+- **Reading the build log.** The stage should show the `Artifactory OIDC token exchange: scope=...`
+  line, then the plugin's `Deploying artifact: <url>` line, and the build should finish `SUCCESS` — a
+  401/403 makes `artifactoryUpload` throw, so a green build means the upload was accepted. The log does
+  not print an explicit "deployment succeeded", so also confirm the file exists (and its properties) in
+  Artifactory. `Failed sending usage report to Artifactory: ... Could not get Artifactory version`
+  is non-fatal plugin noise, common when `Artifactory.newServer(url: ...)` points at a repo subpath rather
+  than the Artifactory root; compare against a pre-migration build's log before deciding it is new.
+- Report: Jenkinsfile(s) changed, scope chosen per stage and why, Jenkins credential IDs now unused
+  (cleanup candidates such as `artifactory_djsp_rw` — verify no other repo still uses them before
+  anyone deletes them), and the identity-registration status from the previous section. Commit locally;
+  push/PR only after explicit user go-ahead (Step 12).
+
+### Worked example (`ibd-cms-wordpress/ci-cd/Jenkinsfile`, `publish` stage)
+
+```groovy
+// before
+withCredentials([usernamePassword(credentialsId: 'artifactory_djsp_rw', usernameVariable: 'artifactoryUser', passwordVariable: 'artifactoryPass')]) {
+    def server = Artifactory.newServer(url: artifactoryUrl, username: artifactoryUser, password: artifactoryPass)
+    ...
+    server.upload(uploadSpec)
+}
+// after
+withArtifactoryOidcCredentials(scope: 'rw', usernameVariable: 'artifactoryUser', passwordVariable: 'artifactoryPass') {
+    def server = Artifactory.newServer(url: artifactoryUrl, username: artifactoryUser, password: artifactoryPass)
+    ...
+    server.upload(uploadSpec)
+}
+```
+
+The same Jenkinsfile's `build` stage binds `withCredentials([string(credentialsId: 'ACF_PRO_KEY', ...)])`
+— not an Artifactory credential, so it stays exactly as is.
+
+---
+
 ## Inputs — ask for whatever isn't given or discoverable
 
 Don't guess at any of these; ask the user if they aren't supplied or obvious from the repo:
@@ -164,11 +277,11 @@ Don't guess at any of these; ask the user if they aren't supplied or obvious fro
 | Whether this deploy repo actually needs a *new* IAM role at all | Check `instance_profile_name` in the deploy repo's `ec2_stack`/`ec2_instance` module call against every other deploy repo migrated in the same session/sprint — two sibling deploy repos (e.g. an admin UI and its main app) commonly share one EC2 instance profile/role on purpose | If it matches a role already migrated, Steps 7-11 (IAM attachment + RO registration) are **already done** for this project — skip straight to the deploy-repo-only Terraform/Jenkinsfile work (Steps 1-6) and say so explicitly in the commit/PR, don't re-attach or re-register |
 | Which secrets this project actually needs | Grep the deploy repo's `addonPkg`/locals for enabled addons (`NewRelicInfra`, `NewRelicDotNetAgent`, `CrowdStrikeSensor`, `datadog`, others) | Confirm the list with the user before editing — don't silently add secrets for disabled addons |
 | Secrets Manager secret name per secret | Ask, offering known platform-standard names as defaults (e.g. New Relic license key is usually `MktData_NR_Platform_SS_License_Key`) | Never invent a secret name — always confirm |
-| Base branch to branch off of | Ask if not obvious (usually `develop`) | |
+| Base branch to branch off of | Ask if not obvious (usually `develop` for deploy repos; code repos often use `master`/`main` — see "Code repositories") | |
 | AWS account ID(s) the deploy project actually runs in | See the dedicated warning right below this table — do not resolve this from the first account-ID map you find by grepping the IAM repo | Getting this wrong means registering RO in a *live, real* account that has nothing to do with the project, while the account that actually needs it stays broken — both halves of the mistake ship silently, since `terraform apply` succeeds either way |
 | The IAM role name needing RO | Same role migrated in Step 8 (e.g. `dylan-server`) — confirm it's the role the deployed EC2 instances actually assume, not an admin/sibling role in the same IAM repo | Grep the IAM repo for other `role-<project>-*.tf` files and ask if more than one plausibly needs RO |
 | Local path to `dj-terraform-aws-artifactory-token-management` | Ask if not given, or search common dev roots for it | Needed for Step 11 |
-| Jenkinsfile(s) in the deploy repo | `find <deploy-repo> -iname Jenkinsfile` — don't assume there's only one; they're typically under `infrastructure/`, `stack/`, and `switch/` folders | Needed for Step 4, item 6 — **every one found must be checked and cleaned up independently**, not just the first |
+| Jenkinsfile(s) in the deploy repo | `find <deploy-repo> -iname 'Jenkinsfile*'` — don't assume there's only one; they're typically under `infrastructure/`, `stack/`, and `switch/` folders (code repo: `ci-cd/`, the root, or anywhere else) | Needed for Step 4, item 6 — **every one found must be checked and cleaned up independently**, not just the first |
 | Jenkinsfile(s) in the IAM repo | `find <iam-repo> -iname Jenkinsfile` — the IAM repo almost always has its own, driving its own `terraform apply`, entirely separate from the deploy repo's | Needed for Step 8, item 4 — same patterns as the deploy repo's Jenkinsfile(s), checked and cleaned up independently; easy to forget since the IAM repo migration is otherwise pure Terraform |
 | The `dj-shared` library ref each Jenkinsfile pins, if any | Grep each Jenkinsfile found above (deploy repo *and* IAM repo) for `@Library('dj-shared`; if no explicit `@<ref>` is given (e.g. just `@Library("dj-shared") _`), the org-wide default library config applies. **This is checkable directly, not just askable** — run the same gating `gh api` call from Step 4 item 6 against `jenkins-pipeline-shared` with no `?ref=` query param at all (omitting it resolves to the repo's own default branch), which answers the OIDC-awareness question the same way a pinned ref would. Only fall back to asking the user if that lookup itself fails (no GHE access, repo renamed, etc.) | Gates whether it's safe to strip the old credentials in Step 4, item 6 and Step 8, item 4 — check per repo, a confirmed-OIDC-aware default for one repo applies to all since it's the same org-wide library, but re-verify if either repo pins its own explicit ref |
 
@@ -231,24 +344,29 @@ git show <ref>:<module-path>/templates/linux_user_data.sh   | grep -n "accessKey
 git show <ref>:<module-path>/variables.tf                   | grep -n -A4 'variable "installer_config"'
 ```
 
-**For `dj-terracycle` specifically: the fix is already released as of `v0.21.0`.** Its
-`ec2_instance`/`ec2_stack` modules dropped the mandatory `installer_config.artifactory.accessKey`
-validation and do the OIDC token exchange directly in both bootstrap templates from that tag
-forward (verified: `v0.20.0` through `v0.20.3` all still require `accessKey`; `v0.21.0` does not).
-The PR that did this (#234) was closed without merging — don't link to it or treat "merged"/"open"
-PR state as the signal; **check the actual tag content**, not PR history:
+**For `dj-terracycle` specifically: the fix is already released, and the version to target is
+`v0.21.5`.** The `accessKey` removal landed in `v0.21.0`: its `ec2_instance`/`ec2_stack` modules
+dropped the mandatory `installer_config.artifactory.accessKey` validation and do the OIDC token
+exchange directly in both bootstrap templates from that tag forward (verified: `v0.20.0` through
+`v0.20.3` all still require `accessKey`; `v0.21.0` does not). `v0.21.5` is the current recommended
+minimum because it also carries a bug fix for the LinuxCommonInstaller version (per the module's
+maintainer; the module's own release notes are the authority on the exact fix) — still no `accessKey`
+requirement, verified on that tag. The PR that did the original change (#234) was closed without
+merging — don't link to it or treat "merged"/"open" PR state as the signal; **check the actual tag
+content**, not PR history:
 
 ```bash
-gh api repos/newscorp-ghfb/dj-terracycle/contents/ec2_stack/variables.tf?ref=v0.21.0 \
+gh api repos/newscorp-ghfb/dj-terracycle/contents/ec2_stack/variables.tf?ref=v0.21.5 \
   --jq '.content' | base64 -d | grep -n -A4 'variable "installer_config"'   # should show no validation block
 ```
 
-If the deploy project is pinned below `v0.21.0`, **bump the `ref=` on every `dj-terracycle` module
-call in the deploy repo's Terraform to `v0.21.0` or a later tag** (not a branch — this fix is tagged
+If the deploy project is pinned below `v0.21.5`, **bump the `ref=` on every `dj-terracycle` module
+call in the deploy repo's Terraform to `v0.21.5` or a later tag** (not a branch — this fix is tagged
 and released, so there's no reason to pin a branch for it) as part of Step 4, before removing
-`accessKey`. Confirm with the user only if bumping the version could plausibly affect other behavior
-they care about (check the tag's other changes between the pinned version and `v0.21.0`); otherwise
-this is a mechanical prerequisite, not a judgment call.
+`accessKey`. This includes a project already on `v0.21.0`-`v0.21.4`: it no longer requires
+`accessKey` but still lacks the LinuxCommonInstaller fix. Confirm with the user only if bumping the
+version could plausibly affect other behavior they care about (check the tag's other changes between
+the pinned version and `v0.21.5`); otherwise this is a mechanical prerequisite, not a judgment call.
 
 For any *other* shared module (not `dj-terracycle`, or a future `dj-terracycle` regression before a
 fix is tagged) where the template still depends on `accessKey`, **before asking the user how to
@@ -265,8 +383,8 @@ it's merged just because it exists; check its state and whether it's actually be
 
 | Finding | Action |
 |---|---|
-| `dj-terracycle`, pinned below `v0.21.0` | Bump `ref=` to `v0.21.0` or later (a tagged release, not a branch) as part of Step 4 — this is the released fix, mechanical unless the version jump has other side effects worth flagging (see above). |
-| `dj-terracycle`, already pinned at `v0.21.0` or later | Already fixed — safe to proceed, remove `accessKey` from the deploy repo in Step 4 as normal. |
+| `dj-terracycle`, pinned below `v0.21.5` (including `v0.21.0`-`v0.21.4`) | Bump `ref=` to `v0.21.5` or later (a tagged release, not a branch) as part of Step 4 — this is the released fix, mechanical unless the version jump has other side effects worth flagging (see above). |
+| `dj-terracycle`, already pinned at `v0.21.5` or later | Already fixed — safe to proceed, remove `accessKey` from the deploy repo in Step 4 as normal. |
 | Any other shared module: template builds its own header from `.artifactory.accessKey`, and/or `variables.tf` has a validation requiring it non-blank, **and no existing fix PR was found** | **Do not remove `accessKey` from the deploy repo yet.** The shared module needs to be migrated to OIDC first (same pattern as CommonInstaller itself — inline `aws sts get-web-identity-token` + JFrog token exchange in both templates, then drop the `variables.tf` validation). Flag this to the user as a separate, higher-blast-radius change (the module likely has many consumers) and ask how they want to proceed — fixing the module and bumping this project's `ref=` to the fixed version, or leaving `accessKey` in place here as an interim shim until the module is fixed. Don't silently pick one. |
 | Same, but **an existing fix PR/branch was found upstream** | Tell the user about it (number, URL, merged/open/unreleased state) and offer it as a third option alongside "fix it yourself" / "interim shim" — e.g. bump this project's `ref=` to that branch/tag once it's available, or point `installer_branch`-style overrides at it for early testing if it's still unmerged. Still don't pick for them. Don't assume a closed/unmerged PR means no fix shipped — check whether a later tag absorbed the same change under a different PR, the way `dj-terracycle` v0.21.0 did after PR #234 was closed. |
 | Template already does the OIDC exchange itself (no `accessKey` reference) | Safe to proceed — remove `accessKey` from the deploy repo in Step 4 as normal. |
@@ -300,6 +418,11 @@ grep -rn "secretId" <terraform-dir>/*.tf   # already-migrated indicator
 # baseline for whichever installer "entry" this project uses (PowerShell vs Linux have different
 # baselines), not a stale one (see Step 4, item 7)
 grep -n -A3 "installer = {" <terraform-dir>/*.tf
+
+# IBD deploy repos: per-landing-zone CommonInstaller branch in stack/Jenkinsfile (see Step 4, item 7a).
+# Absence is fine — note it and continue. Also look for per-env tfvars overrides of it.
+grep -n "commonInstallerBranch" stack/Jenkinsfile 2>/dev/null
+grep -rn "installer_branch\|commonInstaller" --include=*.tfvars .
 
 # Jenkinsfile-level: dj-shared's terraform() step and its backend/docker credential wiring.
 # Expect more than one (commonly under infrastructure/, stack/, switch/) - check each independently.
@@ -377,7 +500,7 @@ git checkout -b feature/secrets-manager-oidc-migration origin/develop
 
 **For an ECS/build-only component (see "EC2 vs ECS/build-only" above), skip straight to item 6
 below** — items 1-5
-and 7 only apply to EC2-type components, since there's no `installer_config` on an ECS component to
+and 7/7a only apply to EC2-type components, since there's no `installer_config` on an ECS component to
 edit in the first place. **If that ECS component's image pull is also still on the old static-secret
 pattern (see the "Exception" callout above), also do item 8 below.**
 
@@ -705,6 +828,53 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
    GH_HOST=github.dowjones.net gh api repos/Quest/LinuxCommonInstaller/contents/Jenkinsfile.build?ref=develop --jq '.content' | base64 -d | grep 'major_version'
    ```
 
+7a. **Default the Jenkinsfile's `commonInstallerBranch` to `master` in every landing zone.**
+   *(EC2 / CommonInstaller components only; IBD deploy repos.)* In IBD deploy repos, `stack/Jenkinsfile`
+   selects which **CommonInstaller branch** the stack consumes in a `switch (currentLandingZone)` block,
+   with one case per landing zone (`nonprod`, `stag`, `prod`) plus a `default`. Historically each case
+   pinned its own long-lived branch (e.g. `feature/ibd-develop`, `feature/ibd-devops`,
+   `feature/ibd-master`). The standard now is **`commonInstallerBranch = 'master'` in all four cases,
+   including `default`**.
+   ```bash
+   grep -n "commonInstallerBranch" <deploy-repo>/stack/Jenkinsfile
+   ```
+   ```groovy
+   // before (values differed per environment)
+   case 'nonprod':
+       defaultDeployBranch   = 'develop'
+       commonInstallerBranch = 'feature/ibd-develop'
+   ...
+   // after (same value in nonprod, stag, prod and default)
+   case 'nonprod':
+       defaultDeployBranch   = 'develop'
+       commonInstallerBranch = 'master'
+   ```
+   - **Only change `commonInstallerBranch`.** Leave `defaultDeployBranch` alone: it is the branch of the
+     **deploy repo itself** and legitimately differs per environment (e.g. `develop` / `release` /
+     `master`) — don't "fix" it to match. The `Branch`/`BuildNumber` parameters select the application
+     artifact and are unrelated to this change.
+   - **Only `stack/Jenkinsfile`, and only IBD repos.** If the `switch (currentLandingZone)` /
+     `commonInstallerBranch` block isn't there, note that to the user and continue with the rest of the
+     migration — absence isn't an error. If every case already says `'master'`, it's already done; skip.
+   - **Gate it on CommonInstaller's `master` already containing the OIDC pattern.** Otherwise prod would
+     boot an installer that still expects `accessKey`. Check the file for the project's `entry`
+     (`CommonInstaller-aws.ps1` → `MarketData/CommonInstaller`, `functions/shared-functions.ps1`;
+     `CommonInstaller.sh` → `Quest/LinuxCommonInstaller`, `functions/shared-functions.sh`):
+     ```bash
+     GH_HOST=github.dowjones.net gh api "repos/MarketData/CommonInstaller/contents/functions/shared-functions.ps1?ref=master" \
+       --jq '.content' | base64 -d | grep -c "get-web-identity-token"   # 0 = not on master yet; don't switch
+     ```
+     If it isn't on `master` yet, leave the Jenkinsfile alone and flag it to the user, same as Step 0
+     does for an unfixed shared module.
+   - **Check what else can override it.** See where `commonInstallerBranch` is consumed (e.g. passed to
+     Terraform as `-var commonInstaller=...`) and grep the tfvars for a per-env `installer_branch` /
+     `commonInstaller` value — a leftover override silently defeats the change.
+   - **Item 5's `# TEMPORARY` pin and any test value of `commonInstallerBranch` must be back on `master`
+     before the deploy-repo PR merges** (merge CommonInstaller's change to `master` first, then switch
+     the default).
+   - This changes which installer code **prod** runs at its next apply — say so explicitly in the
+     commit/PR body rather than letting it read as a no-op cleanup.
+
 8. **ECS components only — migrate the image-pull secret off the old dynamic Secrets Manager lookup
    onto Platform Engineering's managed, OIDC-refreshed pull secret.** This applies when the task
    definition's `credentials_param_arn`/`repositoryCredentials.credentialsParameter` is fed by a
@@ -785,7 +955,7 @@ In the Terraform directory found in Step 1 (e.g. `stack/<project>/`, `factset/`,
 ## Step 5 — Validate the deploy repo changes
 
 *(EC2-type components only — see "EC2 vs ECS/build-only" above. For an ECS/build-only component,
-there's nothing from items 1-5/7 to validate here; the brace-balance check in Step 4, item 6 already
+there's nothing from items 1-5/7/7a to validate here; the brace-balance check in Step 4, item 6 already
 covers the Jenkinsfile edit.)*
 
 ```bash
@@ -1284,9 +1454,13 @@ effect for this session.
 | Another OPEN PR against `dj-terraform-aws-artifactory-token-management` already uses the priority you were about to assign for the same account (Step 11, item 4a) | Pick a priority higher than every priority already used for that account across `main` *and* every other open PR — don't just take the next unused value on `main` |
 | Assuming a RO-registration PR is safe to leave alone because `gh pr view` showed `mergeable: MERGEABLE` right after pushing it | That status is computed against the base branch *at that moment* — it flips to `CONFLICTING` only once a sibling PR editing the same account's `extra_ro_mappings` list actually merges first. Re-check and fix then (Step 11, item 9), don't treat the push-time status as permanent |
 | Jenkinsfile's `terraform()` call already has none of the three patterns | Already migrated at this layer — skip |
+| Code repo whose Jenkinsfile(s) (and the scripts they source) have no Artifactory-bound credential left | Already clean — report that and stop; don't invent changes (see "Code repositories") |
+| `stack/Jenkinsfile`'s `commonInstallerBranch` is already `'master'` in every `switch (currentLandingZone)` case (Step 4, item 7a) | Already done — skip |
+| No `switch (currentLandingZone)` / `commonInstallerBranch` block in the deploy repo's Jenkinsfile(s) (Step 4, item 7a) | Not an IBD-style stack — note it to the user and continue with the rest of the migration; don't treat it as an error or invent the block |
+| CommonInstaller's `master` doesn't yet contain the OIDC pattern when item 7a would switch `commonInstallerBranch` to it | Don't switch — flag it and ask; prod would otherwise boot an installer that still expects `accessKey` |
 | IAM repo has no Jenkinsfile, or its Jenkinsfile doesn't call `dj-shared`'s `terraform()` step | Nothing to clean up at this layer for the IAM repo — skip Step 8, item 4 |
 | `installer_config.installer.version` already matches or exceeds its installer's current major-version baseline (`entry = "CommonInstaller-aws.ps1"` → `"3.0.*"`; `entry = "CommonInstaller.sh"` → `"3.1.*"`) | Already current (or newer) — skip, don't downgrade (Step 4, item 7) |
-| A deploy component is ECS-type or build-only (no `installer_config`; uses `ecs_service`/`host_match_rule`/`aws_ecs_service`/`aws_ecs_task_definition`, or has no deploy-target Terraform at all) | Skip Steps 0-3, Step 4 items 1-5 and 7, Step 5, and Steps 7-11 entirely for that component. Only do Step 4, item 6 (Jenkinsfile credential cleanup), then Step 6 and Step 12 for the deploy repo alone — no IAM repo involvement at all (see "EC2 vs ECS/build-only") — **unless** the ECS component's image pull is still on the old static-secret pattern (next row) |
+| A deploy component is ECS-type or build-only (no `installer_config`; uses `ecs_service`/`host_match_rule`/`aws_ecs_service`/`aws_ecs_task_definition`, or has no deploy-target Terraform at all) | Skip Steps 0-3, Step 4 items 1-5, 7 and 7a, Step 5, and Steps 7-11 entirely for that component. Only do Step 4, item 6 (Jenkinsfile credential cleanup), then Step 6 and Step 12 for the deploy repo alone — no IAM repo involvement at all (see "EC2 vs ECS/build-only") — **unless** the ECS component's image pull is still on the old static-secret pattern (next row) |
 | An ECS component's task definition still resolves its own image-pull credential via a dynamic `data "aws_secretsmanager_secret"` lookup (`credentials_param_arn`/`repositoryCredentials`), instead of Platform Engineering's managed pull secret | This is the one exception to the row above — do Step 4, item 8 (deploy repo: hardcode the managed secret ARN, move the image to `dj-docker-virtual`) *and* Step 8, item 5 (IAM repo: grant the ECS task execution role read access to that secret + its KMS key), in addition to Step 4 item 6. Nothing else in Steps 0-3/5/7/9-11 applies — see the "Exception" callout under "EC2 vs ECS/build-only" |
 | The shared ECS task execution role targeted by Step 8, item 5 already has other, not-yet-migrated services attached to its legacy Artifactory secrets-policy attachment | Leave that legacy attachment in place — only add the new managed-pull-secret policy/attachment alongside it. Don't remove the legacy one (Step 8, item 1) until every service sharing that role has migrated |
 
@@ -1307,6 +1481,8 @@ effect for this session.
 | Trusting a KMS-decrypt statement whose `Resource` is a hand-built alias ARN (`arn:...:alias/<name>`) just because `terraform plan`/`apply` pass clean | AWS KMS only evaluates a key ARN or key ID as the `Resource` for crypto-operation actions (`kms:Decrypt`/`Encrypt`/etc) — an alias ARN there silently never grants access, `terraform` has no way to catch it, and it only surfaces as a runtime `secretsmanager:GetSecretValue` failure on a CMK-encrypted secret (often with no useful error text on Windows). Resolve the alias to `target_key_arn` via a `data "aws_kms_alias"` lookup instead, and if you have live AWS creds, confirm with `aws iam simulate-principal-policy` against the real key ARN rather than trusting the plan (Step 8, item 3b) |
 | Sending the JFrog OIDC exchange as form-urlencoded | JFrog rejects that with HTTP 415 — it must be a JSON body |
 | Giving Artifactory a Secrets Manager IAM grant | Not needed anymore — Artifactory auth is now pure OIDC/STS, no secret involved |
+| "Fixing" `defaultDeployBranch` while standardizing `commonInstallerBranch` on `master` (Step 4, item 7a) | They're different things: `defaultDeployBranch` is the branch of the **deploy repo** and correctly differs per environment (`develop`/`release`/`master`); only `commonInstallerBranch` (the CommonInstaller branch) becomes `master` everywhere |
+| Switching `commonInstallerBranch` to `master` everywhere before CommonInstaller's `master` has the OIDC pattern, or leaving a feature-branch value/override behind | Gate on `get-web-identity-token` being present on CommonInstaller `master`; grep tfvars for `installer_branch`/`commonInstaller` overrides; revert any test pin (Step 4, item 5) to `master` before the deploy-repo PR merges. The change alters what prod runs at next apply — call it out in the PR |
 | Forgetting to revert a `# TEMPORARY` installer branch pin | Note it in the tfvars comment and remind the user once CommonInstaller's change is merged and published |
 | Removing `installer_config.artifactory.accessKey` without checking the shared EC2 module's own bootstrap template | The module (e.g. `dj-terracycle` `ec2_instance`/`ec2_stack`) often has a `variables.tf` validation requiring `accessKey` non-blank, and a `templates/linux_user_data.sh`/`windows_user_data.ps1` that builds its own header from it to fetch the installer zip itself — independent of anything inside CommonInstaller. Always run Step 0 first. |
 | Assuming a fixed `stack/<project>/` layout | Some projects put `installer_config` directly at the repo root (e.g. `factset/`) or elsewhere — search for it, don't assume |
@@ -1323,6 +1499,9 @@ effect for this session.
 | Only looking for Pattern D near an existing `terraform()` call, or only in repos that already show Patterns A-C | Pattern D is independent of `terraform()` entirely and is often the *only* pattern present in a build-only Jenkinsfile — check every `stage` in every Jenkinsfile for an Artifactory-credentialed `withCredentials`, regardless of whether `terraform()` appears anywhere in the file |
 | Deleting an entire `withCredentials([...])` block because one of its bindings is now unused | Only remove the specific binding entry for the Artifactory credential; leave other, unrelated bindings (e.g. an Apollo key) alone and only unwrap the step if the list becomes empty |
 | Treating other bindings in the same `withCredentials([...])` list as "unrelated, must be preserved" without checking whether they're live code at all | If the other bindings (and/or the stage that consumes them) are already inside a `/* ... */` comment block — i.e. dead code, not actually executing — removing them along with the real Artifactory binding is correct cleanup, not a violation of the "leave unrelated bindings alone" rule above. That rule protects *active* unrelated bindings; it doesn't require preserving commented-out ones. Confirm by checking whether the binding's only consumer is itself commented out before deciding either way |
+| Assuming `develop` is the base branch for a code repo | Deploy repos use `develop`; code repos often use `master`/`main` plus `release/*`. Ask and confirm with `git symbolic-ref refs/remotes/origin/HEAD` (see "Code repositories") |
+| Only reading the Jenkinsfile and missing Artifactory use in the scripts it sources (`. ./ci-cd/jenkins_build.sh`) | Grep the Jenkinsfile's directory for Artifactory usage; keep script bodies unchanged and map the variable names they read onto `usernameVariable`/`passwordVariable` |
+| Treating the Jenkins node's OIDC registration as a given for `rw` publish stages | Wrapper swap alone succeeds; the upload fails at runtime (401/403) if the node role is only registered for `ro`. Verify or flag to Platform Engineering before merge — never edit `extra_rw_mappings` as part of this flow |
 | Editing every script/Jenkinsfile-shaped file found in the repo (e.g. a `Jenkins.bak`, or an alternate `jenkins.docker.sh`/`jenkins_old.sh` sitting next to the active build script) | Only the file(s) actually discovered by `find . -iname Jenkinsfile` are in scope for Step 4 item 6 / Step 8 item 4 — a `.bak` file or an alternate script not referenced by the active Jenkinsfile isn't wired into any real build and editing it accomplishes nothing (and risks confusing a genuinely-still-used fallback with a dead one). Note it to the user as a candidate for cleanup rather than migrating it yourself |
 | Migrating the deploy repo's Jenkinsfile(s) (Step 4, item 6) and treating the IAM repo as Terraform-only, so its own Jenkinsfile keeps the same credential wiring | The IAM repo almost always has its own `Jenkinsfile` driving its own `terraform apply`, independent of the deploy repo's — always run Step 8, item 4 too; this has actually been missed in practice on a real migration (caught only after the fact, as a follow-up commit to the already-open IAM repo PR) |
 | Leaving `installer_config.installer.version` pinned to a stale major-version wildcard (e.g. `"2.1.*"`) | Check `installer_config.installer.entry` to know which installer/baseline applies (`CommonInstaller-aws.ps1` → `"3.0.*"` from `build.ps1`; `CommonInstaller.sh` → `"3.1.*"` from `Jenkinsfile.build`'s `major_version`), both on `develop`, and bump to match — a stale wildcard matches no currently-published package and breaks provisioning at boot, independent of whether the rest of the secrets-manager migration is otherwise already done (Step 4, item 7) |
