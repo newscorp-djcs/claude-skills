@@ -344,24 +344,29 @@ git show <ref>:<module-path>/templates/linux_user_data.sh   | grep -n "accessKey
 git show <ref>:<module-path>/variables.tf                   | grep -n -A4 'variable "installer_config"'
 ```
 
-**For `dj-terracycle` specifically: the fix is already released as of `v0.21.0`.** Its
-`ec2_instance`/`ec2_stack` modules dropped the mandatory `installer_config.artifactory.accessKey`
-validation and do the OIDC token exchange directly in both bootstrap templates from that tag
-forward (verified: `v0.20.0` through `v0.20.3` all still require `accessKey`; `v0.21.0` does not).
-The PR that did this (#234) was closed without merging — don't link to it or treat "merged"/"open"
-PR state as the signal; **check the actual tag content**, not PR history:
+**For `dj-terracycle` specifically: the fix is already released, and the version to target is
+`v0.21.5`.** The `accessKey` removal landed in `v0.21.0`: its `ec2_instance`/`ec2_stack` modules
+dropped the mandatory `installer_config.artifactory.accessKey` validation and do the OIDC token
+exchange directly in both bootstrap templates from that tag forward (verified: `v0.20.0` through
+`v0.20.3` all still require `accessKey`; `v0.21.0` does not). `v0.21.5` is the current recommended
+minimum because it also carries a bug fix for the LinuxCommonInstaller version (per the module's
+maintainer; the module's own release notes are the authority on the exact fix) — still no `accessKey`
+requirement, verified on that tag. The PR that did the original change (#234) was closed without
+merging — don't link to it or treat "merged"/"open" PR state as the signal; **check the actual tag
+content**, not PR history:
 
 ```bash
-gh api repos/newscorp-ghfb/dj-terracycle/contents/ec2_stack/variables.tf?ref=v0.21.0 \
+gh api repos/newscorp-ghfb/dj-terracycle/contents/ec2_stack/variables.tf?ref=v0.21.5 \
   --jq '.content' | base64 -d | grep -n -A4 'variable "installer_config"'   # should show no validation block
 ```
 
-If the deploy project is pinned below `v0.21.0`, **bump the `ref=` on every `dj-terracycle` module
-call in the deploy repo's Terraform to `v0.21.0` or a later tag** (not a branch — this fix is tagged
+If the deploy project is pinned below `v0.21.5`, **bump the `ref=` on every `dj-terracycle` module
+call in the deploy repo's Terraform to `v0.21.5` or a later tag** (not a branch — this fix is tagged
 and released, so there's no reason to pin a branch for it) as part of Step 4, before removing
-`accessKey`. Confirm with the user only if bumping the version could plausibly affect other behavior
-they care about (check the tag's other changes between the pinned version and `v0.21.0`); otherwise
-this is a mechanical prerequisite, not a judgment call.
+`accessKey`. This includes a project already on `v0.21.0`-`v0.21.4`: it no longer requires
+`accessKey` but still lacks the LinuxCommonInstaller fix. Confirm with the user only if bumping the
+version could plausibly affect other behavior they care about (check the tag's other changes between
+the pinned version and `v0.21.5`); otherwise this is a mechanical prerequisite, not a judgment call.
 
 For any *other* shared module (not `dj-terracycle`, or a future `dj-terracycle` regression before a
 fix is tagged) where the template still depends on `accessKey`, **before asking the user how to
@@ -378,8 +383,8 @@ it's merged just because it exists; check its state and whether it's actually be
 
 | Finding | Action |
 |---|---|
-| `dj-terracycle`, pinned below `v0.21.0` | Bump `ref=` to `v0.21.0` or later (a tagged release, not a branch) as part of Step 4 — this is the released fix, mechanical unless the version jump has other side effects worth flagging (see above). |
-| `dj-terracycle`, already pinned at `v0.21.0` or later | Already fixed — safe to proceed, remove `accessKey` from the deploy repo in Step 4 as normal. |
+| `dj-terracycle`, pinned below `v0.21.5` (including `v0.21.0`-`v0.21.4`) | Bump `ref=` to `v0.21.5` or later (a tagged release, not a branch) as part of Step 4 — this is the released fix, mechanical unless the version jump has other side effects worth flagging (see above). |
+| `dj-terracycle`, already pinned at `v0.21.5` or later | Already fixed — safe to proceed, remove `accessKey` from the deploy repo in Step 4 as normal. |
 | Any other shared module: template builds its own header from `.artifactory.accessKey`, and/or `variables.tf` has a validation requiring it non-blank, **and no existing fix PR was found** | **Do not remove `accessKey` from the deploy repo yet.** The shared module needs to be migrated to OIDC first (same pattern as CommonInstaller itself — inline `aws sts get-web-identity-token` + JFrog token exchange in both templates, then drop the `variables.tf` validation). Flag this to the user as a separate, higher-blast-radius change (the module likely has many consumers) and ask how they want to proceed — fixing the module and bumping this project's `ref=` to the fixed version, or leaving `accessKey` in place here as an interim shim until the module is fixed. Don't silently pick one. |
 | Same, but **an existing fix PR/branch was found upstream** | Tell the user about it (number, URL, merged/open/unreleased state) and offer it as a third option alongside "fix it yourself" / "interim shim" — e.g. bump this project's `ref=` to that branch/tag once it's available, or point `installer_branch`-style overrides at it for early testing if it's still unmerged. Still don't pick for them. Don't assume a closed/unmerged PR means no fix shipped — check whether a later tag absorbed the same change under a different PR, the way `dj-terracycle` v0.21.0 did after PR #234 was closed. |
 | Template already does the OIDC exchange itself (no `accessKey` reference) | Safe to proceed — remove `accessKey` from the deploy repo in Step 4 as normal. |
